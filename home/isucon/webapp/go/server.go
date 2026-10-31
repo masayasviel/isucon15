@@ -41,10 +41,7 @@ func NewServer(config *Config) *echo.Echo {
 
 	_ = os.MkdirAll(imageDir, 0o755)
 	go watchImageFileGeneration(db)
-	// DB(asia2) と同じリージョンの asia は画像が多く転送も安いため、先読みしない。
-	if config.Region != "asia" {
-		go prefetchRegionPostImages(db, config.Region)
-	}
+	go prefetchImages(db, config.Region)
 	// 検索用の列を初期データと突き合わせる。initialize でも実行するため、ここでは失敗しても起動を止めない。
 	go func() { _ = syncDisplayNameSearch(context.Background(), db) }()
 
