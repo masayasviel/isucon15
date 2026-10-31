@@ -63,12 +63,9 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 
 		// 削除状態を毎回確認する。即時反映も5秒以内の許容範囲に含まれる。
-		var object struct {
-			Data      []byte `db:"data"`
-			MediaType string `db:"media_type"`
-		}
-		err = h.DB.GetContext(ctx, &object, `
-   SELECT i.data, i.media_type
+		var mediaType string
+		err = h.DB.GetContext(ctx, &mediaType, `
+   SELECT i.media_type
    FROM image_objects i JOIN users u ON u.id = i.owner_user_id AND u.status = 'active'
    WHERE i.id = $1 AND (
      u.profile_image_id = i.id
@@ -93,6 +90,30 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if exp <= time.Now().Unix() {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
-		return c.Blob(http.StatusOK, object.MediaType, object.Data)
+
+		name, ok := imageFileName(input.ImageID)
+		if ok && imageFileExists(name) {
+			return sendImageFile(c, mediaType, name)
+		}
+		// 別サーバで作成された画像はファイルが無いため DB から読む。
+		var data []byte
+		err = h.DB.GetContext(ctx, &data, `SELECT data FROM image_objects WHERE id = $1`, input.ImageID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return NewAPIError(http.StatusForbidden, "image_forbidden")
+		}
+		if err != nil {
+			return err
+		}
+		if ok && writeImageFile(input.ImageID, data) == nil {
+			return sendImageFile(c, mediaType, name)
+		}
+		return c.Blob(http.StatusOK, mediaType, data)
 	}
+}
+
+// nginx は X-Accel-Redirect でもこのレスポンスの Content-Type と Cache-Control を引き継ぐ。
+func sendImageFile(c *echo.Context, mediaType, name string) error {
+	c.Response().Header().Set("Content-Type", mediaType)
+	c.Response().Header().Set("X-Accel-Redirect", imageInternalPathPrefix+name)
+	return c.NoContent(http.StatusOK)
 }

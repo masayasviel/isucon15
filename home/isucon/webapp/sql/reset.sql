@@ -40,4 +40,9 @@ SELECT id, follower_id, followee_id, created_at, updated_at FROM initial_follows
 INSERT INTO block_relations (id, blocker_id, blocked_id, created_at)
 SELECT id, blocker_id, blocked_id, created_at FROM initial_block_relations;
 
+-- 各サーバが画像ファイルのキャッシュを初期化するための世代番号。
+CREATE TABLE IF NOT EXISTS image_file_generation (id int PRIMARY KEY, generation bigint NOT NULL);
+INSERT INTO image_file_generation (id, generation) VALUES (1, 1)
+ON CONFLICT (id) DO UPDATE SET generation = image_file_generation.generation + 1;
+
 COMMIT;

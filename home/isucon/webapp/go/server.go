@@ -38,6 +38,9 @@ func NewServer(config *Config) *echo.Echo {
 		panic("failed to ping database: " + err.Error())
 	}
 
+	_ = os.MkdirAll(imageDir, 0o755)
+	go watchImageFileGeneration(db)
+
 	handlerContext := &HandlerContext{
 		DB:     db,
 		Config: config,
