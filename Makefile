@@ -1,7 +1,8 @@
 .PHONY: deploy nginx-log-reset nginx-log-rotate
 
 IP := $(shell hostname -I | awk '{print $$1}' | tr '.' '-')
-LOG_FILE := /home/isucon/analysis/nginx/access.$(IP).log
+NGINX_LOG_DIR := /home/isucon/analysis/nginx
+LOG_FILE := $(NGINX_LOG_DIR)/access.$(IP).log
 
 deploy:
 	$(MAKE) -C home/isucon/webapp/go isureal
@@ -12,5 +13,6 @@ nginx-log-reset:
 	sudo systemctl reload nginx
 
 nginx-log-rotate:
+	mkdir -p $(NGINX_LOG_DIR)
 	sudo cat /var/log/nginx/access.log | alp ltsv > $(LOG_FILE)
 	cat $(LOG_FILE)
