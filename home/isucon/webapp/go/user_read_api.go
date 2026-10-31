@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
-	"slices"
 	"strings"
 
 	"github.com/jmoiron/sqlx"
@@ -123,27 +122,31 @@ func getUserHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		viewer := GetSession(c).UserID
-		user, err := getUser(ctx, h.DB, input.UserID)
+		var record struct {
+			User
+			Blocked bool `db:"blocked"`
+			Friends bool `db:"friends"`
+		}
+		err := h.DB.GetContext(c.Request().Context(), &record, `
+   SELECT `+strings.Join(userColumns, ", ")+`,
+    EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1)) AS blocked,
+    EXISTS(SELECT 1 FROM friendships WHERE (user_low_id=$1 AND user_high_id=$2) OR (user_low_id=$2 AND user_high_id=$1)) AS friends
+   FROM users WHERE id=$2 AND status='active'
+  `, GetSession(c).UserID, input.UserID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "relationship_not_found")
 		}
 		if err != nil {
 			return err
 		}
-		blocked, err := isBlocked(ctx, h.DB, viewer, user.ID)
-		if err != nil {
-			return err
-		}
-		if blocked {
+		if record.Blocked {
 			return NewAPIError(http.StatusNotFound, "relationship_not_found")
 		}
-		friends, err := getFriendIDs(ctx, h.DB, viewer)
-		if err != nil {
+		user := record.User
+		if err := user.setImageKey(); err != nil {
 			return err
 		}
-		if user.AccountType != "certified_public" && !slices.Contains(friends, user.ID) {
+		if user.AccountType != "certified_public" && !record.Friends {
 			user.Bio = ""
 		}
 		return c.JSON(http.StatusOK, getUserResponse(newRelationshipUserResponse(user)))

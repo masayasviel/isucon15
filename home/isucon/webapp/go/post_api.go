@@ -176,35 +176,18 @@ type getMyCurrentPostResponse createPostResponse
 
 func getMyCurrentPostHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		ctx := c.Request().Context()
-		userID := GetSession(c).UserID
-		var postID string
-		err := h.DB.GetContext(ctx, &postID, `
-   SELECT p.id FROM posts p
-   JOIN posting_windows w ON w.id = p.posting_window_id
-   JOIN users u ON u.id = p.author_id
-   JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
-                              AND current.local_date = w.local_date
-   WHERE p.author_id = $1 AND p.deleted_at IS NULL
-  `, userID)
-		if errors.Is(err, sql.ErrNoRows) {
+		posts, err := selectPostsWithAuthor(c.Request().Context(), h.DB, `
+   AND p.author_id = $1
+   AND w.local_date = (SELECT current.local_date FROM posting_windows current
+                       WHERE current.region = u.region AND current.ended_at IS NULL)
+  `, GetSession(c).UserID)
+		if err != nil {
+			return err
+		}
+		if len(posts) == 0 {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
-		if err != nil {
-			return err
-		}
-		post, err := getPost(ctx, h.DB, postID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "post_not_found")
-		}
-		if err != nil {
-			return err
-		}
-		user, err := getUser(ctx, h.DB, userID)
-		if err != nil {
-			return err
-		}
-		return c.JSON(http.StatusOK, getMyCurrentPostResponse(newPostResponse(post, user)))
+		return c.JSON(http.StatusOK, getMyCurrentPostResponse(newPostResponse(posts[0].Post, posts[0].Author)))
 	}
 }
 
@@ -273,8 +256,8 @@ func updatePostHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		var lockedUserID string
-		if err := tx.GetContext(ctx, &lockedUserID, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID); err != nil {
+		user, err := lockUser(ctx, tx, userID)
+		if err != nil {
 			return err
 		}
 		post, err := getPost(ctx, tx, input.PostID)
@@ -287,30 +270,17 @@ func updatePostHandler(h *HandlerContext) echo.HandlerFunc {
 		if post.AuthorID != userID {
 			return NewAPIError(http.StatusForbidden, "post_not_editable")
 		}
-		window, err := getPostingWindow(ctx, tx, post.PostingWindowID)
-		if err != nil {
-			return err
-		}
-		if window.EndedAt != nil {
+		if post.WindowEndedAt != nil {
 			return NewAPIError(http.StatusForbidden, "post_not_editable")
 		}
+		if _, err := tx.ExecContext(ctx, `UPDATE posts SET caption = coalesce($2, caption), visibility = coalesce($3, visibility) WHERE id = $1`, post.ID, input.Caption, input.Visibility); err != nil {
+			return err
+		}
 		if input.Caption != nil {
-			if _, err := tx.ExecContext(ctx, `UPDATE posts SET caption = $2 WHERE id = $1`, post.ID, *input.Caption); err != nil {
-				return err
-			}
+			post.Caption = *input.Caption
 		}
 		if input.Visibility != nil {
-			if _, err := tx.ExecContext(ctx, `UPDATE posts SET visibility = $2 WHERE id = $1`, post.ID, *input.Visibility); err != nil {
-				return err
-			}
-		}
-		post, err = getPost(ctx, tx, post.ID)
-		if err != nil {
-			return err
-		}
-		user, err := getUser(ctx, tx, userID)
-		if err != nil {
-			return err
+			post.Visibility = *input.Visibility
 		}
 		if err := tx.Commit(); err != nil {
 			return err

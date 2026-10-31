@@ -50,35 +50,32 @@ func createCommentHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
+		// beginRelationshipTx と同じく本人は排他、投稿者は共有でロックし、同じ投稿者へのコメントを互いに待たせない。
 		for _, id := range slices.Compact([]string{min(actor, post.AuthorID), max(actor, post.AuthorID)}) {
+			lockMode := "FOR SHARE"
+			if id == actor {
+				lockMode = "FOR NO KEY UPDATE"
+			}
 			var lockedID string
-			if err := tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE`, id); err != nil {
+			if err := tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 `+lockMode, id); err != nil {
 				return err
 			}
 		}
-		allowed, err := canComment(ctx, tx, actor, post.ID)
+		viewer, allowed, err := canComment(ctx, tx, actor, post.ID)
 		if err != nil {
 			return err
 		}
 		if !allowed {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		}
-		id := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO comments(id,post_id,author_id,body,created_at) VALUES($1,$2,$3,$4,clock_timestamp())`, id, post.ID, actor, input.Body); err != nil {
-			return err
-		}
-		comment, err := getComment(ctx, tx, id)
-		if err != nil {
-			return err
-		}
-		user, err := getUser(ctx, tx, actor)
-		if err != nil {
+		var comment Comment
+		if err := tx.GetContext(ctx, &comment, `INSERT INTO comments(id,post_id,author_id,body,created_at) VALUES($1,$2,$3,$4,clock_timestamp()) RETURNING id,post_id,author_id,body,created_at,deleted_at`, uuid.NewString(), post.ID, actor, input.Body); err != nil {
 			return err
 		}
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-		return c.JSON(http.StatusCreated, newCommentResponse(comment, user))
+		return c.JSON(http.StatusCreated, newCommentResponse(comment, viewer.User))
 	}
 }
 
@@ -103,7 +100,7 @@ func getCommentsHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
 		ctx := c.Request().Context()
-		allowed, err := canComment(ctx, h.DB, GetSession(c).UserID, input.PostID)
+		_, allowed, err := canComment(ctx, h.DB, GetSession(c).UserID, input.PostID)
 		if err != nil {
 			return err
 		}

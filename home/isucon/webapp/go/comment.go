@@ -18,12 +18,6 @@ type Comment struct {
 	DeletedAt *time.Time `db:"deleted_at"`
 }
 
-func getComment(ctx context.Context, db sqlx.QueryerContext, id string) (Comment, error) {
-	var comment Comment
-	err := sqlx.GetContext(ctx, db, &comment, `SELECT id,post_id,author_id,body,created_at,deleted_at FROM comments WHERE id=$1`, id)
-	return comment, err
-}
-
 type CommentWithAuthor struct {
 	Comment
 	Author User `db:"author"`
@@ -45,29 +39,30 @@ func selectCommentsWithAuthor(ctx context.Context, db sqlx.QueryerContext, condi
 	return comments, nil
 }
 
-func canComment(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string) (bool, error) {
+// 判定に読んだ閲覧者の情報も返す。呼び出し側はユーザーを読み直さずに済む。
+func canComment(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string) (viewerContext, bool, error) {
 	post, err := getPostWithAuthor(ctx, db, postID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return viewerContext{}, false, nil
 	}
 	if err != nil {
-		return false, err
+		return viewerContext{}, false, err
 	}
 	viewer, err := loadViewerContext(ctx, db, viewerID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return viewerContext{}, false, nil
 	}
 	if err != nil {
-		return false, err
+		return viewerContext{}, false, err
 	}
 	if !viewer.canView(post.Post) || post.WindowEndedAt != nil {
-		return false, nil
+		return viewer, false, nil
 	}
 	if viewer.ID == post.AuthorID {
-		return viewer.HasPostedToday, nil
+		return viewer, viewer.HasPostedToday, nil
 	}
 	if post.Visibility == "public" {
-		return true, nil
+		return viewer, true, nil
 	}
-	return viewer.Friends[post.AuthorID], nil
+	return viewer, viewer.Friends[post.AuthorID], nil
 }

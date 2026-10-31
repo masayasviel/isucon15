@@ -188,41 +188,23 @@ func (viewer viewerContext) canView(post Post) bool {
 	}
 }
 
-func canViewPost(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string) (bool, error) {
+// 判定に読んだ閲覧者の情報も返す。呼び出し側はユーザーを読み直さずに済む。
+func canViewPost(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string) (viewerContext, bool, error) {
 	post, err := getPostWithAuthor(ctx, db, postID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return viewerContext{}, false, nil
 	}
 	if err != nil {
-		return false, err
+		return viewerContext{}, false, err
 	}
 	viewer, err := loadViewerContext(ctx, db, viewerID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return viewerContext{}, false, nil
 	}
 	if err != nil {
-		return false, err
+		return viewerContext{}, false, err
 	}
-	return viewer.canView(post.Post), nil
-}
-
-func getFriendIDs(ctx context.Context, db sqlx.QueryerContext, userID string) ([]string, error) {
-	var friendships []struct {
-		UserLowID  string `db:"user_low_id"`
-		UserHighID string `db:"user_high_id"`
-	}
-	if err := sqlx.SelectContext(ctx, db, &friendships, `SELECT user_low_id, user_high_id FROM friendships WHERE user_low_id = $1 OR user_high_id = $1`, userID); err != nil {
-		return nil, err
-	}
-	var ids []string
-	for _, friendship := range friendships {
-		if friendship.UserLowID == userID {
-			ids = append(ids, friendship.UserHighID)
-		} else {
-			ids = append(ids, friendship.UserLowID)
-		}
-	}
-	return ids, nil
+	return viewer, viewer.canView(post.Post), nil
 }
 
 func getBlockedUserIDs(ctx context.Context, db sqlx.QueryerContext, userID string) (map[string]bool, error) {

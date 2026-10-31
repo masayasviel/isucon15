@@ -61,15 +61,25 @@ func beginRelationshipTx(ctx context.Context, db *sqlx.DB, actor, target string)
 	return tx, nil
 }
 
-func isBlocked(ctx context.Context, db sqlx.QueryerContext, actor, target string) (bool, error) {
-	var blocked bool
-	err := sqlx.GetContext(ctx, db, &blocked, `SELECT EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1))`, actor, target)
-	return blocked, err
-}
-
 func insertFriendship(ctx context.Context, tx *sqlx.Tx, request FriendRequest) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id) VALUES ($1,$2,$3,$4)`, uuid.NewString(), min(request.RequesterID, request.RecipientID), max(request.RequesterID, request.RecipientID), request.ID)
 	return err
+}
+
+// 申請の承認と友達関係の作成を1文で行う。
+// user_low_id と user_high_id は insertFriendship と同じく Go の比較で決める。SQL の LEAST / GREATEST は照合順序で結果が変わる。
+func acceptFriendRequest(ctx context.Context, tx *sqlx.Tx, request FriendRequest) (FriendRequest, error) {
+	var accepted FriendRequest
+	err := tx.GetContext(ctx, &accepted, `
+  WITH accepted AS (
+    UPDATE friend_requests SET status='accepted', updated_at=clock_timestamp() WHERE id=$1
+    RETURNING `+friendRequestColumns+`
+  ), friendship AS (
+    INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id) VALUES ($2,$3,$4,$1)
+  )
+  SELECT `+friendRequestColumns+` FROM accepted
+ `, request.ID, uuid.NewString(), min(request.RequesterID, request.RecipientID), max(request.RequesterID, request.RecipientID))
+	return accepted, err
 }
 
 func requireRelationshipChange(result sql.Result, err error, status int, code string) error {

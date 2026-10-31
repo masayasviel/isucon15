@@ -80,37 +80,37 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		allowed, err := canViewPost(ctx, tx, actor, post.ID)
+		viewer, allowed, err := canViewPost(ctx, tx, actor, post.ID)
 		if err != nil {
 			return err
 		}
 		if !allowed {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE realmojis SET replaced_at=clock_timestamp() WHERE post_id=$1 AND reactor_id=$2 AND replaced_at IS NULL AND deleted_at IS NULL`, post.ID, actor); err != nil {
-			return err
-		}
 		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type) VALUES($1,$2,$3,'image/jpeg')`, imageID, actor, data); err != nil {
-			return err
-		}
-		id := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO realmojis(id,post_id,reactor_id,image_id,reaction_type,created_at) VALUES($1,$2,$3,$4,$5,clock_timestamp())`, id, post.ID, actor, imageID, input.ReactionType); err != nil {
-			return err
-		}
-		reaction, err := getRealMoji(ctx, tx, id)
-		if err != nil {
-			return err
-		}
-		user, err := getUser(ctx, tx, actor)
-		if err != nil {
+		var reaction RealMoji
+		// realmojis_one_active に違反しないよう、replaced の件数を INSERT の入力にして UPDATE を先に完了させる。
+		if err := tx.GetContext(ctx, &reaction, `
+   WITH replaced AS (
+     UPDATE realmojis SET replaced_at = clock_timestamp()
+     WHERE post_id = $1 AND reactor_id = $2 AND replaced_at IS NULL AND deleted_at IS NULL
+     RETURNING id
+   ), image AS (
+     INSERT INTO image_objects (id, owner_user_id, data, media_type)
+     VALUES ($3, $2, $4, 'image/jpeg')
+   )
+   INSERT INTO realmojis (id, post_id, reactor_id, image_id, reaction_type, created_at)
+   SELECT $5::text, $1, $2, $3, $6::text, clock_timestamp()
+   FROM (SELECT count(*) FROM replaced) AS replaced_count
+   RETURNING id, post_id, reactor_id, image_id, reaction_type, created_at, replaced_at, deleted_at
+  `, post.ID, actor, imageID, data, uuid.NewString(), input.ReactionType); err != nil {
 			return err
 		}
 		if err := tx.Commit(); err != nil {
 			return err
 		}
 		_ = writeImageFile(imageID, data)
-		return c.JSON(http.StatusCreated, newRealMojiResponse(reaction, user))
+		return c.JSON(http.StatusCreated, newRealMojiResponse(reaction, viewer.User))
 	}
 }
 
@@ -135,7 +135,7 @@ func getRealMojisHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
 		ctx := c.Request().Context()
-		allowed, err := canViewPost(ctx, h.DB, GetSession(c).UserID, input.PostID)
+		_, allowed, err := canViewPost(ctx, h.DB, GetSession(c).UserID, input.PostID)
 		if err != nil {
 			return err
 		}

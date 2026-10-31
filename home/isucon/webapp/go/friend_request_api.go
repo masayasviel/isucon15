@@ -123,26 +123,28 @@ func transitionFriendRequestHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		request, err = getFriendRequest(ctx, tx, input.RequestID)
-		if err != nil {
+		var state struct {
+			FriendRequest
+			Blocked bool `db:"blocked"`
+		}
+		if err := tx.GetContext(ctx, &state, `
+   SELECT `+friendRequestColumns+`,
+    EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id=requester_id AND blocked_id=recipient_id) OR (blocker_id=recipient_id AND blocked_id=requester_id)) AS blocked
+   FROM friend_requests WHERE id=$1
+  `, input.RequestID); err != nil {
 			return err
 		}
-		if request.Status != "pending" {
+		if state.Status != "pending" {
 			return NewAPIError(http.StatusForbidden, "relationship_action_forbidden")
 		}
 		if status == "accepted" {
-			blocked, err := isBlocked(ctx, tx, request.RequesterID, request.RecipientID)
-			if err != nil {
-				return err
-			}
-			if blocked {
+			if state.Blocked {
 				return NewAPIError(http.StatusConflict, "relationship_conflict")
 			}
-			if err := insertFriendship(ctx, tx, request); err != nil {
-				return err
-			}
+			request, err = acceptFriendRequest(ctx, tx, state.FriendRequest)
+		} else {
+			request, err = updateFriendRequestStatus(ctx, tx, state.ID, status)
 		}
-		request, err = updateFriendRequestStatus(ctx, tx, request.ID, status)
 		if err != nil {
 			return err
 		}
