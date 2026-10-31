@@ -174,3 +174,4 @@
 .idea/
 
 !Makefile
+/home/isucon/webapp/public/._.
