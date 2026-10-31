@@ -41,33 +41,16 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 
 		ctx := c.Request().Context()
-		var secretKeyHash string
-		err = h.DB.GetContext(ctx, &secretKeyHash, `
-   SELECT u.secret_key_hash
-   FROM image_objects i JOIN users u ON u.id = i.owner_user_id
-   WHERE i.id = $1 AND u.status = 'active'
-  `, input.ImageID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusForbidden, "image_forbidden")
+		// 署名鍵の取得と削除状態の確認を1本のクエリで行う（#24）。
+		// 判定順序は従来どおり: 行なし -> 署名不一致 -> 権限なし -> exp 再確認。
+		// 削除状態は毎回確認する。即時反映も5秒以内の許容範囲に含まれる。
+		var record struct {
+			SecretKeyHash string `db:"secret_key_hash"`
+			MediaType     string `db:"media_type"`
+			Allowed       bool   `db:"allowed"`
 		}
-		if err != nil {
-			return err
-		}
-		key, err := imageSigningKey(secretKeyHash)
-		if err != nil {
-			return err
-		}
-		if !hmac.Equal(sig, imageSignature(key, input.ImageID, exp)) {
-			c.Set("abuse", "invalid_signature")
-			return NewAPIError(http.StatusForbidden, "image_forbidden")
-		}
-
-		// 削除状態を毎回確認する。即時反映も5秒以内の許容範囲に含まれる。
-		var mediaType string
-		err = h.DB.GetContext(ctx, &mediaType, `
-   SELECT i.media_type
-   FROM image_objects i JOIN users u ON u.id = i.owner_user_id AND u.status = 'active'
-   WHERE i.id = $1 AND (
+		err = h.DB.GetContext(ctx, &record, `
+   SELECT u.secret_key_hash, i.media_type, (
      u.profile_image_id = i.id
      OR EXISTS (
        SELECT 1 FROM posts p
@@ -79,7 +62,9 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
        JOIN users author ON author.id = p.author_id AND author.status = 'active'
        WHERE r.image_id = i.id AND r.reactor_id = u.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
      )
-   )
+   ) IS TRUE AS allowed
+   FROM image_objects i JOIN users u ON u.id = i.owner_user_id AND u.status = 'active'
+   WHERE i.id = $1
   `, input.ImageID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
@@ -87,13 +72,24 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
+		key, err := imageSigningKey(record.SecretKeyHash)
+		if err != nil {
+			return err
+		}
+		if !hmac.Equal(sig, imageSignature(key, input.ImageID, exp)) {
+			c.Set("abuse", "invalid_signature")
+			return NewAPIError(http.StatusForbidden, "image_forbidden")
+		}
+		if !record.Allowed {
+			return NewAPIError(http.StatusForbidden, "image_forbidden")
+		}
 		if exp <= time.Now().Unix() {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
 
 		name, ok := imageFileName(input.ImageID)
 		if ok && imageFileExists(name) {
-			return sendImageFile(c, mediaType, name)
+			return sendImageFile(c, record.MediaType, name)
 		}
 		// 別サーバで作成された画像はファイルが無いため DB から読む。
 		var data []byte
@@ -105,9 +101,9 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		if ok && writeImageFile(input.ImageID, data) == nil {
-			return sendImageFile(c, mediaType, name)
+			return sendImageFile(c, record.MediaType, name)
 		}
-		return c.Blob(http.StatusOK, mediaType, data)
+		return c.Blob(http.StatusOK, record.MediaType, data)
 	}
 }
 
