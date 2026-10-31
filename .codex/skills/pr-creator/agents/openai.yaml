@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR作成"
+  short_description: "コミット履歴と差分からレビュー可能なPR本文を作成。"
+  default_prompt: "$pr-creator を使って現在のブランチのコミット履歴と差分からpull requestを作成してください。"

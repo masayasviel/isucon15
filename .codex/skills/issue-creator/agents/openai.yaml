@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue作成"
+  short_description: "リポジトリの根拠から実行可能なGitHub Issueを作成する。"
+  default_prompt: "$issue-creator を使って、リポジトリの根拠から実行可能なGitHub Issueを日本語で作成してください。"
