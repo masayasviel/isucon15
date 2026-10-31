@@ -1,6 +1,7 @@
 package isureal
 
 import (
+	"context"
 	"os"
 
 	"github.com/jmoiron/sqlx"
@@ -44,6 +45,8 @@ func NewServer(config *Config) *echo.Echo {
 	if config.Region != "asia" {
 		go prefetchRegionPostImages(db, config.Region)
 	}
+	// 検索用の列を初期データと突き合わせる。initialize でも実行するため、ここでは失敗しても起動を止めない。
+	go func() { _ = syncDisplayNameSearch(context.Background(), db) }()
 
 	handlerContext := &HandlerContext{
 		DB:     db,

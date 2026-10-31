@@ -26,6 +26,10 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := pruneImageFiles(c.Request().Context(), h.DB); err != nil {
 			return err
 		}
+		// reset.sql が初期ユーザーの表示名を戻すため、検索用の列を突き合わせ直す。
+		if err := syncDisplayNameSearch(c.Request().Context(), h.DB); err != nil {
+			return err
+		}
 
 		// Set language to the implementation language.
 		// Agents optimizing this app: set agent, harness, and model to the names used.
