@@ -334,20 +334,20 @@ sig = HMAC-SHA256 を 1000 回反復した結果を base64url（パディング�
 
 ### `viewerContext`（`post.go`: `loadViewerContext`）
 
-多くのエンドポイントが、リクエストごとに閲覧者の関係性スナップショットをメモリに構築する。
+多くのエンドポイントが、リクエストごとに閲覧者の関係性スナップショットをメモリに構築する。以下はすべて **1本のSQL** で取得し、ID一覧はJSON文字列で受け取ってGo側でmapにする。
 
 ```
 loadViewerContext(viewerID)
-  ① getUser(viewerID)                    … users 1行（status='active' 限定）
+  ① User                                 … users 1行（status='active' 限定）。無ければ sql.ErrNoRows
   ② HasPostedToday                       … 「自分の region で開催中の枠と同じ local_date の枠に
                                             生存投稿があるか」を EXISTS で判定
   ③ Blocked                              … block_relations から双方向のIDをmapに
-  ④ Friends                              … friendships から自分の友だちIDリスト
-  ⑤ FriendsOfFriends / MutualFriends     … ④で得たID群を IN 句に入れて friendships を再検索
-                                            「友だちの友だち」と「共通友だち数」を集計
+  ④ Friends                              … friendships から自分の友だちID（CTE friends）
+  ⑤ FriendsOfFriends / MutualFriends     … friends を friendships に両方向でJOINし（CTE second_degree）、
+                                            相手IDごとの件数を集計。件数は自分を除いて MutualFriends に入れる
 ```
 
-友だちが0人なら ⑤ はスキップされる。
+友だちが0人なら ⑤ は空になる。`FriendsOfFriends` には自分自身と友だちも含まれる。
 
 ### `canView`（投稿を閲覧できるか）
 
@@ -2270,7 +2270,7 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 | `export_api.go` | 70 | 全投稿の ZIP エクスポート |
 | `posting_window.go` | 23 | `PostingWindow` 型、取得関数 |
 | `posting_window_api.go` | 60 | 開催中の枠と投稿状況 |
-| `post.go` | 230 | **`viewerContext` / `canView` / 友だち・ブロック取得** |
+| `post.go` | 241 | **`viewerContext` / `canView` / 友だち・ブロック取得** |
 | `post_api.go` | 375 | 投稿の作成・取得・更新・削除 |
 | `feed_api.go` | 202 | 4種フィード、レコメンドスコア |
 | `memory_api.go` | 146 | メモリー（過去の自分の投稿） |
