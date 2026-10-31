@@ -498,11 +498,9 @@ canPost = (同 local_date の生存投稿が 0 件)
 ① Bind → c.Set("username", …)（ログ用）
 ② バリデーション失敗 → 400 invalid_registration
 ③ secretKey = uuid、hash = hex(SHA256(secretKey))
-④ トランザクション開始
-⑤ LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE   ← username の一意性担保のため
-⑥ SELECT EXISTS(… WHERE username = ?)  → あれば 409 username_taken
-⑦ INSERT users (id, username, secret_key_hash, display_name, region)
-⑧ getUser で読み戻して COMMIT
+④ INSERT users (id, username, secret_key_hash, display_name, region)
+     ON CONFLICT (username) DO NOTHING RETURNING …   ← 1 文で完結（明示的なトランザクションなし）
+⑤ 0 行なら 409 username_taken
 ```
 
 **レスポンス** `201 Created`
@@ -519,7 +517,7 @@ canPost = (同 local_date の生存投稿が 0 件)
 
 **エラー**: 400 `invalid_registration` / 409 `username_taken`
 
-> `users.username` にはユニーク制約が無く、`LOCK TABLE` ＋ `EXISTS` で一意性を担保している。スキーマのコメントにも「ユーザー名が一意である必要があります」とある。
+> `users.username` の一意性は UNIQUE インデックス `users_username`（`900-extra-index.sql`）で担保している。部分インデックスではないため、退会済みユーザーのユーザー名も再利用できない。`ON CONFLICT (username)` はこのインデックスが無いとエラーになるので、`make index` をコードのデプロイより先に実行する。
 
 ---
 
@@ -2317,8 +2315,8 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 
 ### 一意性・ロック
 
-- `users.username` に UNIQUE 制約なし。`LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE` ＋ `EXISTS` で担保（`register`）
-- `POST /api/admin/posting-window` も同じ `LOCK TABLE users` を取る
+- `users.username` は UNIQUE インデックス `users_username` で担保。`register` は `INSERT … ON CONFLICT (username) DO NOTHING` の 1 文で登録する
+- `POST /api/admin/posting-window` は `LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE` を取る。`register` の `INSERT` が取る `ROW EXCLUSIVE` と競合するため、通知の一括 INSERT とユーザー登録は直列化される
 - 書き込み系ハンドラはほぼ全てが `SELECT id FROM users WHERE id=? FOR NO KEY UPDATE` で自分（と相手）の行をロック → ユーザー単位で直列化
 - 2者を扱う場合は必ず `min(id) → max(id)` の順でロック（`beginRelationshipTx`、`createCommentHandler`）
 
