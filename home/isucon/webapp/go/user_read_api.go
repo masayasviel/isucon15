@@ -41,17 +41,22 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		ctx := c.Request().Context()
 		viewer := GetSession(c).UserID
-		var users []User
-		if err := h.DB.SelectContext(ctx, &users, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE status='active' AND id<>$1 AND ($2='' OR (username,id)>($2,$3)) ORDER BY username, id`, viewer, input.BeforeUsername, input.BeforeID); err != nil {
-			return err
-		}
 		blocked, err := getBlockedUserIDs(ctx, h.DB, viewer)
 		if err != nil {
 			return err
 		}
+		rows, err := h.DB.QueryxContext(ctx, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE status='active' AND id<>$1 AND ($2='' OR (username,id)>($2,$3)) ORDER BY username, id`, viewer, input.BeforeUsername, input.BeforeID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
 		query := normalizeSearchText(input.Q)
 		items := make([]relationshipUserResponse, 0)
-		for _, user := range users {
+		for rows.Next() {
+			var user User
+			if err := rows.StructScan(&user); err != nil {
+				return err
+			}
 			if !strings.Contains(normalizeSearchText(user.Username), query) && !strings.Contains(normalizeSearchText(user.DisplayName), query) {
 				continue
 			}
@@ -68,6 +73,9 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 			if len(items) == 51 {
 				break
 			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
 		}
 		hasMore := len(items) > 50
 		if hasMore {
