@@ -20,12 +20,22 @@ type FriendRequest struct {
 	UpdatedAt   time.Time `db:"updated_at"`
 }
 
+const friendRequestColumns = `id, requester_id, recipient_id, status, created_at, updated_at`
+
 func getFriendRequest(ctx context.Context, db sqlx.QueryerContext, id string) (FriendRequest, error) {
 	var request FriendRequest
-	err := sqlx.GetContext(ctx, db, &request, `SELECT id, requester_id, recipient_id, status, created_at, updated_at FROM friend_requests WHERE id=$1`, id)
+	err := sqlx.GetContext(ctx, db, &request, `SELECT `+friendRequestColumns+` FROM friend_requests WHERE id=$1`, id)
 	return request, err
 }
 
+func updateFriendRequestStatus(ctx context.Context, tx *sqlx.Tx, id, status string) (FriendRequest, error) {
+	var request FriendRequest
+	err := tx.GetContext(ctx, &request, `UPDATE friend_requests SET status=$2, updated_at=clock_timestamp() WHERE id=$1 RETURNING `+friendRequestColumns, id, status)
+	return request, err
+}
+
+// 本人は排他、相手は共有でロックする。同じ2人への操作は直列のまま、別々のユーザーから同じ相手への操作は競合しない。
+// FOR KEY SHARE は FOR NO KEY UPDATE と競合せず、2人が互いを本人として行う操作が同時に通るため使わない。
 func beginRelationshipTx(ctx context.Context, db *sqlx.DB, actor, target string) (*sqlx.Tx, error) {
 	if actor == target || target == "" {
 		return nil, NewAPIError(http.StatusBadRequest, "invalid_relationship")
@@ -35,8 +45,12 @@ func beginRelationshipTx(ctx context.Context, db *sqlx.DB, actor, target string)
 		return nil, err
 	}
 	for _, id := range []string{min(actor, target), max(actor, target)} {
+		lockMode := "FOR SHARE"
+		if id == actor {
+			lockMode = "FOR NO KEY UPDATE"
+		}
 		var lockedID string
-		if err := tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 AND status='active' FOR NO KEY UPDATE`, id); err != nil {
+		if err := tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 AND status='active' `+lockMode, id); err != nil {
 			tx.Rollback()
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, NewAPIError(http.StatusNotFound, "relationship_not_found")
