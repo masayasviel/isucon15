@@ -76,7 +76,7 @@ PostgreSQL 16  @ ISUREAL_DB_HOST（env.sh では別ホスト）
                        (ip_ban.go: extractClientIP)
 ② ActionLogMiddleware… ハンドラ実行後に JSON 1行ログを stdout へ出力
 ③ middleware.Recover … panic を 500 に変換
-④ IPBanMiddleware   … ip_bans を照合（200ms キャッシュ）→ 該当すれば 403 ip_banned
+④ IPBanMiddleware   … バックグラウンドで 200ms ごとに読み込んだ ip_bans のスナップショットを照合 → 該当すれば 403 ip_banned
 ⑤ SessionMiddleware  … ルートごとに付与。Bearer トークンを検証
 ⑥ RegionMiddleware   … ルートごとに付与。セッションのリージョンとサーバのリージョンを照合
 ⑦ ハンドラ
@@ -167,7 +167,7 @@ Config.Region（サーバ）     session.Region（= users.region）
 | `RegionMiddleware` | 上記以外の全エンドポイントで一致必須 |
 | `posting_windows` | `UNIQUE(region, local_date)` ＋ `ended_at IS NULL` の行はリージョンごとに**最大1件**（部分ユニークインデックス `posting_windows_one_active_region`） |
 | 投稿枠の取得 | `WHERE region = <ユーザーの region> AND ended_at IS NULL`（`post_api.go`, `posting_window_api.go`） |
-| 枠オープン | 管理者が `region` を指定して開く。`notifications` はそのリージョンの active ユーザー全員に INSERT |
+| 枠オープン | 管理者が `region` を指定して開く。通知はそのリージョンの開いている枠から SSE が導出する |
 | `HasPostedToday` 判定 | 「自分の region で現在開いている枠」と同じ `local_date` の枠に投稿があるか（`post.go`） |
 | SSE 通知 | 接続中に `users.region` がセッション時のリージョンと変わったら接続を閉じる（`notification_api.go`） |
 | `PATCH /api/me` | `region` を変更できる。変更後はそのユーザーは別リージョンのサーバでしか API を使えなくなる |
@@ -386,17 +386,16 @@ post.Visibility == "public"       ─▶ true
 ```
  管理者: POST /api/admin/posting-window {region, localDate, onTimeSeconds}
     │
-    ├─ LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE
+    ├─ pg_advisory_xact_lock(hashtext(region))  … 同じリージョンの枠開始を直列化
     ├─ 同 region に local_date >= 指定日 の枠があれば 409 posting_window_conflict
     ├─ startsAt = clock_timestamp()
     ├─ UPDATE posting_windows SET ended_at = startsAt WHERE region=? AND ended_at IS NULL
     │     → 旧枠を閉じる（この瞬間、旧枠の投稿は canView で見えなくなる）
-    ├─ INSERT posting_windows (starts_at = startsAt,
-    │                          on_time_deadline = startsAt + onTimeSeconds秒)
-    └─ INSERT notifications … そのリージョンの status='active' ユーザー全員分
+    └─ INSERT posting_windows (starts_at = startsAt,
+                               on_time_deadline = startsAt + onTimeSeconds秒)
            │
            ▼
-      GET /api/notifications (SSE) が拾って配信
+      GET /api/notifications (SSE) が開いている枠を見つけて配信
 ```
 
 `ended_at IS NULL` の行はリージョンごとに1件だけ（部分ユニークインデックスで DB が保証）。
@@ -763,7 +762,7 @@ canPost = (同 local_date の生存投稿が 0 件)
 | コメント / RealMoji | 同様に一覧から消える |
 | 画像 | `image_api.go` が所有者 `status='active'` を要求するので 403 になる |
 | セッション | 全て無効化。`getSessionFromHeader` も `u.status='active'` を要求 |
-| 友だち関係 | `friendships` の行は残る（`getFriendIDs` はフィルタしないが、表示側で JOIN により除外） |
+| 友だち関係 | `friendships` の行は残る（`loadViewerContext` はフィルタしないが、表示側で JOIN により除外） |
 
 ---
 
@@ -870,11 +869,10 @@ canPost = (同 local_date の生存投稿が 0 件)
 **処理の流れ**
 
 ```
-① getUser(userId)（status='active' 限定）
+① ユーザー（status='active' 限定）、ブロック関係（双方向）、友だち関係を1クエリで取得
      行なし → 404 relationship_not_found
-② isBlocked(自分, 相手)（双方向）→ true なら 404 relationship_not_found
-③ getFriendIDs(自分)
-④ accountType != 'certified_public' かつ 友だちでない → bio = ""
+② ブロック関係あり → 404 relationship_not_found
+③ accountType != 'certified_public' かつ 友だちでない → bio = ""
 ```
 
 **レスポンス** `200 OK` — `relationshipUserResponse`
@@ -1029,16 +1027,11 @@ canPost = (同 local_date の生存投稿が 0 件)
 **処理の流れ**
 
 ```
-① SELECT p.id FROM posts p
-     JOIN posting_windows w ON w.id = p.posting_window_id
-     JOIN users u ON u.id = p.author_id
-     JOIN posting_windows current
-          ON current.region = u.region AND current.ended_at IS NULL
-         AND current.local_date = w.local_date
-     WHERE p.author_id = ? AND p.deleted_at IS NULL
+① selectPostsWithAuthor で投稿と投稿者を1クエリで取得
+     AND p.author_id = ?
+     AND w.local_date = (SELECT current.local_date FROM posting_windows current
+                         WHERE current.region = u.region AND current.ended_at IS NULL)
      行なし → 404 post_not_found
-② getPost(postID) → 行なし → 404 post_not_found
-③ getUser(自分)
 ```
 
 **レスポンス** `200 OK` — `createPostResponse`
@@ -1100,13 +1093,12 @@ canPost = (同 local_date の生存投稿が 0 件)
 ② caption が制約違反 → 400 invalid_post
 ③ visibility が3種以外 → 400 invalid_post
 ④ トランザクション開始
-⑤ SELECT id FROM users WHERE id=? FOR NO KEY UPDATE
+⑤ lockUser(自分)
 ⑥ getPost(postId) → 行なし → 404 post_not_found
 ⑦ post.AuthorID != 自分 → 403 post_not_editable
-⑧ getPostingWindow(post.PostingWindowID)
-⑨ window.EndedAt != NULL → 403 post_not_editable   ← 枠が閉じたら編集不可
-⑩ 指定された項目ごとに個別 UPDATE
-⑪ 読み戻して COMMIT
+⑧ post.WindowEndedAt != NULL → 403 post_not_editable   ← 枠が閉じたら編集不可
+⑨ UPDATE posts SET caption = coalesce(?, caption), visibility = coalesce(?, visibility)
+⑩ COMMIT
 ```
 
 **レスポンス** `200 OK` — `createPostResponse`
@@ -1359,11 +1351,11 @@ postedAt != beforePostedAt    → postedAt < beforePostedAt
 ① body が 1〜1000 文字でない → 400 invalid_interaction
 ② getPost(postId) → 行なし → 403 interaction_forbidden   ★404 ではない
 ③ トランザクション開始
-④ 自分と投稿者の users 行を ID 昇順でロック（FOR NO KEY UPDATE）
+④ 自分と投稿者の users 行を ID 昇順でロック（自分は FOR NO KEY UPDATE、投稿者は FOR SHARE）
      ※ slices.Compact で自分＝投稿者のときは1回だけ
 ⑤ canComment(自分, postId) が false → 403 interaction_forbidden
-⑥ INSERT comments (uuid, post_id, author_id, body, created_at=clock_timestamp())
-⑦ 読み戻し + getUser(自分) → COMMIT
+⑥ INSERT comments (uuid, post_id, author_id, body, created_at=clock_timestamp()) RETURNING …
+⑦ COMMIT（レスポンスの投稿者は canComment が読んだ閲覧者の情報を使う）
 ```
 
 **レスポンス** `201 Created`
@@ -1484,13 +1476,14 @@ RealMoji は「自撮り写真で返すリアクション」。1投稿につき1
      どちらかが非 active → 404 relationship_not_found
      → 2人の users 行を ID 昇順でロック（自分は FOR NO KEY UPDATE、投稿者は FOR SHARE）
 ⑧ canViewPost(自分, postId) が false → 403 interaction_forbidden
-⑨ UPDATE realmojis SET replaced_at = now
-     WHERE post_id=? AND reactor_id=? AND replaced_at IS NULL AND deleted_at IS NULL
-     ← 既存の現役 RealMoji を「置き換え済み」にする
-⑩ INSERT image_objects (uuid, 自分, data, 'image/jpeg')   ※created_at は DEFAULT
-⑪ INSERT realmojis (uuid, post_id, reactor_id, image_id, reaction_type,
-                     created_at = clock_timestamp())
-⑫ 読み戻し + getUser(自分) → COMMIT
+⑨ 次の3つを1文で実行（UPDATE の完了後に realmojis の INSERT が動く）
+     ├─ UPDATE realmojis SET replaced_at = now
+     │    WHERE post_id=? AND reactor_id=? AND replaced_at IS NULL AND deleted_at IS NULL
+     │    ← 既存の現役 RealMoji を「置き換え済み」にする
+     ├─ INSERT image_objects (uuid, 自分, data, 'image/jpeg')   ※created_at は DEFAULT
+     └─ INSERT realmojis (uuid, post_id, reactor_id, image_id, reaction_type,
+                          created_at = clock_timestamp()) RETURNING …
+⑩ COMMIT（レスポンスの投稿者は canViewPost が読んだ閲覧者の情報を使う）
 ```
 
 部分ユニークインデックス `realmojis_one_active ON (post_id, reactor_id) WHERE replaced_at IS NULL AND deleted_at IS NULL` が、現役が1つだけであることを DB レベルで保証する。
@@ -1627,17 +1620,18 @@ RealMoji は「自撮り写真で返すリアクション」。1投稿につき1
 ```
 ① connectedAt = SELECT clock_timestamp()（DBの現在時刻）
 ② ヘッダを即送信: Content-Type: text/event-stream, 200 OK → Flush
-③ 500ms ごとのループ:
-     ├─ getUser(自分)
-     │     エラー（削除された等）→ 接続終了
-     ├─ user.Region != session.Region → 接続終了   ★リージョン移動で切れる
-     ├─ SELECT n.id, n.posting_window_id, w.region, n.created_at
-     │    FROM notifications n JOIN posting_windows w ON w.id = n.posting_window_id
-     │    WHERE n.user_id = ? AND n.created_at > connectedAt AND w.ended_at IS NULL
-     │    ORDER BY n.created_at, n.id LIMIT 1
-     ├─ 見つかった → "data: {json}\n\n" を書いて Flush し、★return（接続終了）
-     ├─ ErrNoRows 以外のエラー → 接続終了
-     └─ ctx.Done() または ticker を待つ
+③ NotificationHub に購読を登録し、次のどちらかを待つ
+     ├─ 通知 → "data: {json}\n\n" を書いて Flush し、★return（接続終了）
+     ├─ 切断の指示 → 接続終了
+     └─ ctx.Done()
+
+NotificationHub.watch（サーバごとに1つ。500ms ごとに実行し、接続が無ければクエリを発行しない）:
+     ├─ SELECT u.id, w.id, w.starts_at FROM users u
+     │    LEFT JOIN posting_windows w ON w.region = u.region AND w.ended_at IS NULL
+     │    WHERE u.id = ANY(接続中のユーザー) AND u.region = サーバのリージョン AND u.status = 'active'
+     ├─ 行が無い（退会、リージョン変更）→ 切断の指示   ★リージョン移動で切れる
+     ├─ w.starts_at > connectedAt → 通知を送る
+     └─ クエリのエラー → 接続中の SSE すべてに切断の指示
 ```
 
 **レスポンス** `200 OK`、`Content-Type: text/event-stream`
@@ -1647,14 +1641,16 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 
 ```
 
-- **接続後に作られた通知**のみ対象（`created_at > connectedAt`）。接続前の通知は配信されない
+- 通知は `notifications` の行ではなく、開いている投稿枠から導出する
+- **接続後に開始した枠**のみ対象（`starts_at > connectedAt`）。接続前に開始した枠は配信されない
+- `createdAt` は枠の `starts_at`。`id` はユーザーと枠から決まる値で、同じユーザー・同じ枠なら接続が別でも同じ
 - **枠が開いているもの**のみ（`w.ended_at IS NULL`）
 - 1件送ったら接続を閉じる。クライアントは再接続して待ち受ける必要がある
 - エラーは HTTP ステータスで返らない（ヘッダ送信済みのため）。異常時は単に接続が閉じる
 
 **エラー**: 401 `invalid_session` / 403 `region_mismatch`（いずれもヘッダ送信前なので通常の JSON エラー）
 
-> 接続1本あたり 500ms ごとに2クエリ（`getUser` + 通知検索）が走る。
+> クエリは接続数によらず、サーバごとに 500ms に1本。
 
 ---
 
@@ -1771,11 +1767,12 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
      または accept/reject なのに recipient でない
      → 403 relationship_action_forbidden
 ④ beginRelationshipTx(自分, 申請のもう一方のユーザー)
-⑤ 申請を再取得して status != 'pending' → 403 relationship_action_forbidden
+⑤ 申請とブロック関係（双方向）を1クエリで再取得
+     status != 'pending' → 403 relationship_action_forbidden
 ⑥ accept の場合:
-     ├─ isBlocked(双方向) → true なら 409 relationship_conflict
-     └─ INSERT friendships
-⑦ UPDATE friend_requests SET status = <新status>, updated_at = now RETURNING …
+     ├─ ブロック関係あり → 409 relationship_conflict
+     └─ UPDATE friend_requests と INSERT friendships を1文で実行
+⑦ reject / cancel の場合: UPDATE friend_requests SET status = <新status>, updated_at = now RETURNING …
 ⑧ COMMIT
 ```
 
@@ -2110,7 +2107,7 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 
 | 項目 | 内容 |
 |---|---|
-| 処理内容 | 新しい投稿枠を開き、対象リージョンの全ユーザーに通知を作る |
+| 処理内容 | 新しい投稿枠を開く。通知は SSE がこの枠から導出する |
 | 認証 | 管理者 |
 | リージョン | 不要（`region` はボディで指定） |
 | 実装 | `admin_posting_window_api.go` |
@@ -2133,8 +2130,8 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 ① region 不正 または localDate パース失敗 → 400 invalid_posting_window
 ② seconds = onTimeSeconds ?? 86400
 ③ トランザクション開始
-④ LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE
-     ← 通知の一括 INSERT とユーザー登録・リージョン変更を直列化するため
+④ SELECT pg_advisory_xact_lock(hashtext(region))
+     ← 同じリージョンの枠開始を直列化し、同時実行でも片方を 409 にするため
 ⑤ SELECT EXISTS(SELECT 1 FROM posting_windows
                 WHERE region=? AND local_date >= ?)
      → true なら 409 posting_window_conflict
@@ -2145,11 +2142,7 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 ⑧ INSERT posting_windows (uuid, region, local_date,
                            starts_at = startsAt,
                            on_time_deadline = startsAt + seconds秒)
-⑨ INSERT INTO notifications (id, user_id, posting_window_id, created_at)
-     SELECT gen_random_uuid()::text, id, <windowID>, startsAt
-     FROM users WHERE region = ? AND status = 'active'
-     ← 対象リージョンの全 active ユーザー分を一括 INSERT
-⑩ 読み戻して COMMIT
+⑨ 読み戻して COMMIT
 ```
 
 **レスポンス** `201 Created`
@@ -2174,7 +2167,7 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
              →  旧枠の投稿へのコメントが canComment で false になる
 新枠を開く    →  全ユーザーの canPost が true に戻る（削除回数 < 2 の範囲で）
              →  HasPostedToday が false に戻る（＝再び「投稿しないと見えない」状態）
-通知を作る    →  SSE 接続中のクライアントに配信される
+             →  SSE 接続中のクライアントに配信される
 ```
 
 ---
@@ -2268,40 +2261,40 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 | ファイル | 行数 | 役割 |
 |---|---|---|
 | `cmd/isureal/main.go` | 11 | エントリポイント。`:8080` で listen |
-| `server.go` | 91 | **全ルーティング定義 + DB初期化 + ミドルウェア登録** |
+| `server.go` | 107 | **全ルーティング定義 + DB初期化 + ミドルウェア登録** |
 | `config.go` | 46 | 環境変数の読み込み、DSN 構築 |
 | `region.go` | 22 | `RegionMiddleware` |
 | `api_error.go` | 47 | `APIError` 型と `APIErrorHandler` |
 | `action_log.go` | 111 | アクションログ（`actionNames` が全ルートの一覧） |
-| `ip_ban.go` | 81 | `ip_bans` の 200ms キャッシュ、`X-Client-IP` 抽出 |
+| `ip_ban.go` | 87 | `ip_bans` の 200ms ごとのバックグラウンド読み込み、`X-Client-IP` 抽出 |
 | `session.go` | 162 | ユーザーセッションの検証・発行・無効化 |
 | `admin_session.go` | 115 | 管理者セッション |
 | `user.go` | 65 | `User` 型、バリデーション関数、`userColumns` |
 | `user_api.go` | 223 | register / login / logout / getMe / updateMe |
-| `user_read_api.go` | 121 | ユーザー検索 / ユーザー取得 |
+| `user_read_api.go` | 158 | ユーザー検索 / ユーザー取得 |
 | `profile_image_api.go` | 97 | プロフィール画像の設定・削除 |
 | `account_deletion_api.go` | 39 | アカウント論理削除 |
 | `export_api.go` | 70 | 全投稿の ZIP エクスポート |
 | `posting_window.go` | 23 | `PostingWindow` 型、取得関数 |
 | `posting_window_api.go` | 60 | 開催中の枠と投稿状況 |
-| `post.go` | 241 | **`viewerContext` / `canView` / 友だち・ブロック取得** |
-| `post_api.go` | 375 | 投稿の作成・取得・更新・削除 |
+| `post.go` | 223 | **`viewerContext` / `canView` / 友だち・ブロック取得** |
+| `post_api.go` | 345 | 投稿の作成・取得・更新・削除 |
 | `feed_api.go` | 202 | 4種フィード、レコメンドスコア |
 | `memory_api.go` | 146 | メモリー（過去の自分の投稿） |
-| `comment.go` | 73 | `Comment` 型、`canComment` |
-| `comment_api.go` | 172 | コメントの作成・一覧・削除 |
-| `realmoji.go` | 47 | `RealMoji` 型、現役 RealMoji の取得 |
-| `realmoji_api.go` | 203 | RealMoji の作成・一覧・削除 |
+| `comment.go` | 68 | `Comment` 型、`canComment` |
+| `comment_api.go` | 169 | コメントの作成・一覧・削除 |
+| `realmoji.go` | 41 | `RealMoji` 型、現役 RealMoji の取得 |
+| `realmoji_api.go` | 204 | RealMoji の作成・一覧・削除 |
 | `image_signature.go` | 42 | 署名付きURL生成（HMAC 1000回反復） |
 | `image_api.go` | 98 | 画像配信と署名検証 |
-| `notification_api.go` | 82 | SSE 通知（ワンショット） |
-| `relationship.go` | 87 | `beginRelationshipTx` / `isBlocked` / 共通ヘルパ |
+| `notification_api.go` | 167 | SSE 通知（ワンショット）、`NotificationHub` |
+| `relationship.go` | 97 | `beginRelationshipTx` / `acceptFriendRequest` / 共通ヘルパ |
 | `relationship_api.go` | 178 | フレンド解除 / フォロー / ブロック |
 | `relationship_list_api.go` | 102 | 関係性一覧（5種） |
-| `friend_request_api.go` | 154 | フレンド申請の作成・遷移 |
+| `friend_request_api.go` | 156 | フレンド申請の作成・遷移 |
 | `admin_api.go` | 69 | 管理者ログイン / ログアウト |
 | `admin_user_api.go` | 39 | 認定公開アカウントの付与・（禁止された）解除 |
-| `admin_posting_window_api.go` | 88 | 投稿枠のオープン |
+| `admin_posting_window_api.go` | 83 | 投稿枠のオープン |
 | `initialize.go` | 32 | `/api/initialize` |
 
 ## 3.4 実装上の注意点・引っかかりどころ
@@ -2336,8 +2329,8 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 ### 一意性・ロック
 
 - `users.username` は UNIQUE インデックス `users_username` で担保。`register` は `INSERT … ON CONFLICT (username) DO NOTHING` の 1 文で登録する
-- `POST /api/admin/posting-window` は `LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE` を取る。`register` の `INSERT` が取る `ROW EXCLUSIVE` と競合するため、通知の一括 INSERT とユーザー登録は直列化される
-- 書き込み系ハンドラはほぼ全てが `SELECT id FROM users WHERE id=? FOR NO KEY UPDATE` で自分（と相手）の行をロック → ユーザー単位で直列化。ただし `beginRelationshipTx` の相手の行は `FOR SHARE`
+- `POST /api/admin/posting-window` は `pg_advisory_xact_lock` で同じリージョンの枠開始を直列化する。`users` のテーブルロックは取らず、`notifications` にも書き込まない（通知は開いている枠から導出する）
+- 書き込み系ハンドラはほぼ全てが `SELECT id FROM users WHERE id=? FOR NO KEY UPDATE` で自分（と相手）の行をロック → ユーザー単位で直列化。ただし `beginRelationshipTx` の相手の行と `createCommentHandler` の投稿者の行は `FOR SHARE`
 - 2者を扱う場合は必ず `min(id) → max(id)` の順でロック（`beginRelationshipTx`、`createCommentHandler`）
 
 ### クエリの重さ
@@ -2347,7 +2340,7 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 - `GET /api/me/export`: `LIMIT` が無く、全投稿の画像バイナリをメモリ上の ZIP に詰める
 - `signedImageURL`: HMAC-SHA256 を **1000 回反復**。レスポンスに含まれる画像URL1本ごとに実行される
 - `User.setImageKey()`: `selectPostsWithAuthor` / `selectCommentsWithAuthor` / `selectCurrentRealMojis` が取得行ごとに呼ぶ
-- `GET /api/notifications`: 接続1本あたり 500ms 間隔で2クエリ
+- `GET /api/notifications`: サーバごとに 500ms 間隔で1クエリ（接続が無ければ発行しない）
 - `posts` のインデックスは `posts_author_id` と `posts_posting_window_id` のみ（`posted_at` 系の複合インデックスは無い）
 
 ### その他
