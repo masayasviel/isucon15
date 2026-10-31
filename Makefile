@@ -1,4 +1,4 @@
-.PHONY: deploy nginx-log-reset nginx-log-rotate index index-verify
+.PHONY: deploy nginx-log-reset nginx-log-rotate index index-drop index-verify
 
 IP := $(shell hostname -I | awk '{print $$1}' | tr '.' '-')
 NOW := $(shell date +%Y%m%d-%H%M%S)
@@ -39,9 +39,16 @@ PSQL = set -eu; \
 		--dbname="$$ISUREAL_DB_NAME" \
 		--set=ON_ERROR_STOP=1
 
+# 900-extra-index.sql の追加インデックスを適用する。
 index:
 	$(PSQL) --file=$(SQL_DIR)/900-extra-index.sql
 
+# 効果が無かったインデックスを名前で指定して外す (make index-drop NAME=xxx)。
+index-drop:
+	test -n "$(NAME)" || { echo 'usage: make index-drop NAME=<index_name>' >&2; exit 1; }
+	$(PSQL) --command='DROP INDEX IF EXISTS $(NAME)'
+
+# インデックスが存在し、実際に Index Scan で使われているかを確認する。
 index-verify:
 	$(PSQL) --command='\d login_sessions'
 	$(PSQL) --command="EXPLAIN SELECT s.user_id, s.token_hash, s.created_at, u.region \
