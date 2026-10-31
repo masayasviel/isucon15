@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -103,15 +104,27 @@ func loadImageData(ctx context.Context, db sqlx.QueryerContext, imageIDs []strin
 
 const imagePrefetchBatchSize = 100
 
-// 自リージョンの利用者の投稿画像を、ファイルが無いものだけ少しずつ DB から取得して書き出す。
-// エクスポートはリージョン内のサーバで処理されるため、DB と別リージョンのサーバで転送を減らすのに使う。
-func prefetchRegionPostImages(db *sqlx.DB, region string) {
+// 次の画像を、ファイルが無いものだけ少しずつ DB から取得して書き出す。
+//   - 自リージョンの利用者の投稿画像（エクスポートと Memories で読む）
+//   - その投稿に付いた現役の RealMoji の画像
+//   - 全リージョンの active ユーザーのプロフィール画像（他リージョンの利用者のものも画面に出る）
+func prefetchImages(db *sqlx.DB, region string) {
 	ctx := context.Background()
+	startedAt := time.Now()
 	var ids []string
 	if err := db.SelectContext(ctx, &ids, `
   SELECT p.image_id FROM posts p JOIN users u ON u.id = p.author_id
   WHERE u.region = $1 AND p.deleted_at IS NULL
+  UNION
+  SELECT r.image_id FROM realmojis r
+  JOIN posts p ON p.id = r.post_id AND p.deleted_at IS NULL
+  JOIN users u ON u.id = p.author_id
+  WHERE u.region = $1 AND r.replaced_at IS NULL AND r.deleted_at IS NULL
+  UNION
+  SELECT profile_image_id FROM users
+  WHERE status = 'active' AND profile_image_id IS NOT NULL
  `, region); err != nil {
+		slog.Error("failed to list images to prefetch", "error", err)
 		return
 	}
 	missing := make([]string, 0, len(ids))
@@ -120,12 +133,15 @@ func prefetchRegionPostImages(db *sqlx.DB, region string) {
 			missing = append(missing, id)
 		}
 	}
+	slog.Info("image prefetch started", "images", len(missing))
 	for start := 0; start < len(missing); start += imagePrefetchBatchSize {
 		end := min(start+imagePrefetchBatchSize, len(missing))
 		if _, err := loadImageData(ctx, db, missing[start:end]); err != nil {
+			slog.Error("failed to prefetch images", "error", err, "finished", start)
 			return
 		}
 	}
+	slog.Info("image prefetch finished", "images", len(missing), "elapsed", time.Since(startedAt))
 }
 
 // DB に存在しない画像のファイルを消す。
