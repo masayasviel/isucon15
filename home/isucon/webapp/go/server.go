@@ -13,9 +13,10 @@ import (
 )
 
 type HandlerContext struct {
-	DB     *sqlx.DB
-	Config *Config
-	IPBans *IPBanList
+	DB            *sqlx.DB
+	Config        *Config
+	IPBans        *IPBanList
+	Notifications *NotificationHub
 }
 
 func NewServer(config *Config) *echo.Echo {
@@ -50,14 +51,16 @@ func NewServer(config *Config) *echo.Echo {
 	go func() { _ = syncDisplayNameSearch(context.Background(), db) }()
 
 	handlerContext := &HandlerContext{
-		DB:     db,
-		Config: config,
-		IPBans: &IPBanList{},
+		DB:            db,
+		Config:        config,
+		IPBans:        &IPBanList{},
+		Notifications: newNotificationHub(),
 	}
 	if err := handlerContext.IPBans.reload(context.Background(), db); err != nil {
 		slog.Error("failed to load ip bans", "error", err)
 	}
 	go handlerContext.IPBans.watch(db)
+	go handlerContext.Notifications.watch(db, config.Region)
 	e.Use(IPBanMiddleware(handlerContext))
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))

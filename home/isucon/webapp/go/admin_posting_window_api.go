@@ -43,7 +43,8 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		if _, err := tx.ExecContext(ctx, `LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		// 同じリージョンの投稿枠の開始を直列化し、同時実行でも片方を 409 にする。
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, region); err != nil {
 			return err
 		}
 		var conflict bool
@@ -65,12 +66,6 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
    INSERT INTO posting_windows (id, region, local_date, starts_at, on_time_deadline)
    VALUES ($1, $2, $3, $4, $5)
   `, windowID, region, localDate, startsAt, startsAt.Add(time.Duration(seconds)*time.Second)); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
-   INSERT INTO notifications (id, user_id, posting_window_id, created_at)
-   SELECT gen_random_uuid()::text, id, $2, $3 FROM users WHERE region = $1 AND status = 'active'
-  `, region, windowID, startsAt); err != nil {
 			return err
 		}
 		window, err := getPostingWindow(ctx, tx, windowID)
