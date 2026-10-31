@@ -58,6 +58,76 @@ func writeImageFile(imageID string, data []byte) error {
 	return os.Rename(tmp, filepath.Join(imageDir, name))
 }
 
+// 画像の実体をファイルから読み、ファイルが無いものだけ DB からまとめて取得してファイルへ書き出す。
+// DB にも無い画像は結果に含めない。
+func loadImageData(ctx context.Context, db sqlx.QueryerContext, imageIDs []string) (map[string][]byte, error) {
+	images := make(map[string][]byte, len(imageIDs))
+	missing := make([]string, 0)
+	for _, id := range imageIDs {
+		if _, ok := images[id]; ok {
+			continue
+		}
+		if name, ok := imageFileName(id); ok {
+			if data, err := os.ReadFile(filepath.Join(imageDir, name)); err == nil {
+				images[id] = data
+				continue
+			}
+		}
+		missing = append(missing, id)
+	}
+	if len(missing) == 0 {
+		return images, nil
+	}
+	query, args, err := sqlx.In(`SELECT id, data FROM image_objects WHERE id IN (?)`, missing)
+	if err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		ID   string `db:"id"`
+		Data []byte `db:"data"`
+	}
+	if err := sqlx.SelectContext(ctx, db, &rows, sqlx.Rebind(sqlx.DOLLAR, query), args...); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		images[row.ID] = row.Data
+	}
+	// ファイルの書き出しは応答に不要なので、リクエストを待たせない。
+	go func() {
+		for _, row := range rows {
+			_ = writeImageFile(row.ID, row.Data)
+		}
+	}()
+	return images, nil
+}
+
+const imagePrefetchBatchSize = 100
+
+// 自リージョンの利用者の投稿画像を、ファイルが無いものだけ少しずつ DB から取得して書き出す。
+// エクスポートはリージョン内のサーバで処理されるため、DB と別リージョンのサーバで転送を減らすのに使う。
+func prefetchRegionPostImages(db *sqlx.DB, region string) {
+	ctx := context.Background()
+	var ids []string
+	if err := db.SelectContext(ctx, &ids, `
+  SELECT p.image_id FROM posts p JOIN users u ON u.id = p.author_id
+  WHERE u.region = $1 AND p.deleted_at IS NULL
+ `, region); err != nil {
+		return
+	}
+	missing := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if name, ok := imageFileName(id); ok && !imageFileExists(name) {
+			missing = append(missing, id)
+		}
+	}
+	for start := 0; start < len(missing); start += imagePrefetchBatchSize {
+		end := min(start+imagePrefetchBatchSize, len(missing))
+		if _, err := loadImageData(ctx, db, missing[start:end]); err != nil {
+			return
+		}
+	}
+}
+
 // DB に存在しない画像のファイルを消す。
 // ファイルは DB への書き込み後に作られるため、ReadDir の後に ID を取得すれば作成中の画像を消さない。
 func pruneImageFiles(ctx context.Context, db *sqlx.DB) error {
