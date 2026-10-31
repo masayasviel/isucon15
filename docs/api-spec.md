@@ -498,11 +498,9 @@ canPost = (同 local_date の生存投稿が 0 件)
 ① Bind → c.Set("username", …)（ログ用）
 ② バリデーション失敗 → 400 invalid_registration
 ③ secretKey = uuid、hash = hex(SHA256(secretKey))
-④ トランザクション開始
-⑤ LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE   ← username の一意性担保のため
-⑥ SELECT EXISTS(… WHERE username = ?)  → あれば 409 username_taken
-⑦ INSERT users (id, username, secret_key_hash, display_name, region)
-⑧ getUser で読み戻して COMMIT
+④ INSERT users (id, username, secret_key_hash, display_name, region)
+     ON CONFLICT (username) DO NOTHING RETURNING …   ← 1 文で完結（明示的なトランザクションなし）
+⑤ 0 行なら 409 username_taken
 ```
 
 **レスポンス** `201 Created`
@@ -519,7 +517,7 @@ canPost = (同 local_date の生存投稿が 0 件)
 
 **エラー**: 400 `invalid_registration` / 409 `username_taken`
 
-> `users.username` にはユニーク制約が無く、`LOCK TABLE` ＋ `EXISTS` で一意性を担保している。スキーマのコメントにも「ユーザー名が一意である必要があります」とある。
+> `users.username` の一意性は UNIQUE インデックス `users_username`（`900-extra-index.sql`）で担保している。部分インデックスではないため、退会済みユーザーのユーザー名も再利用できない。`ON CONFLICT (username)` はこのインデックスが無いとエラーになるので、`make index` をコードのデプロイより先に実行する。
 
 ---
 
@@ -987,31 +985,35 @@ canPost = (同 local_date の生存投稿が 0 件)
 ⑤ 画像を全読み → jpeg.Decode 失敗 → 400 invalid_post
 ⑥ 幅 > 4096 または 高さ > 4096 → 400 invalid_post
 ⑦ トランザクション開始
-⑧ SELECT id FROM users WHERE id=? FOR NO KEY UPDATE   ← 自分の行をロック
-⑨ getUser(自分)
-⑩ SELECT id, local_date, starts_at FROM posting_windows
-     WHERE region = <自分の region> AND ended_at IS NULL FOR UPDATE
+⑧ SELECT <userColumns> FROM users WHERE id=? AND status='active' FOR NO KEY UPDATE
+     ← 自分の行をロックして取得し、setImageKey を呼ぶ
+⑨ 投稿枠のロックと、同 local_date の自分の投稿数の集計を1文で行う
+     SELECT w.id, w.starts_at, w.on_time_deadline,
+            (未削除の投稿数のスカラーサブクエリ) AS active,
+            (削除済みの投稿数のスカラーサブクエリ) AS deleted
+     FROM posting_windows w
+     WHERE w.region = <自分の region> AND w.ended_at IS NULL FOR SHARE OF w
      行なし → 409 post_slot_unavailable
-⑪ 同 local_date の自分の投稿数を集計
-     SELECT count FILTER(deleted_at IS NULL) AS active,
-            count FILTER(deleted_at IS NOT NULL) AS deleted
-     FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
-     WHERE p.author_id = ? AND w.local_date = ?
-⑫ postedAt = time.Now().UTC()
+⑩ postedAt = time.Now().UTC()
    active != 0 || deleted >= 2 || postedAt < window.starts_at
      → 409 post_slot_unavailable
-⑬ INSERT image_objects (uuid, 自分, data, 'image/jpeg', created_at = postedAt)
-⑭ INSERT posts (uuid, author, window, image, caption, visibility,
-                 location_*, posted_at = postedAt)
-⑮ getPost で読み戻し → COMMIT
+⑪ データ変更CTEで画像と投稿を1文で INSERT する
+     WITH image AS (
+       INSERT image_objects (uuid, 自分, data, 'image/jpeg', created_at = postedAt)
+     )
+     INSERT posts (uuid, author, window, image, caption, visibility,
+                   location_*, posted_at = postedAt)
+     RETURNING posts の各カラム
+   on_time_deadline は ⑨ の値を使う
+⑫ COMMIT → 画像をファイルに書き出す（失敗は無視）
 ```
 
 **レスポンス** `201 Created` — `createPostResponse`
 
 **エラー**: 400 `invalid_post` / 401 `invalid_session` / 403 `region_mismatch` / 409 `post_slot_unavailable`
 
-> ⑩ は `sql.ErrNoRows` のとき**まったく同じクエリをもう一度実行**している（実装のまま。リトライとして意味を持たない）。
-> ⑬ で `image_objects.created_at` に `postedAt` を明示している点に注意。`created_at` は月次パーティションのキーなので、対応するパーティションが無い値だと `image_objects_default` に入る。
+> ⑨ は `sql.ErrNoRows` のとき**まったく同じクエリをもう一度実行**している（実装のまま。リトライとして意味を持たない）。
+> ⑪ で `image_objects.created_at` に `postedAt` を明示している点に注意。`created_at` は月次パーティションのキーなので、対応するパーティションが無い値だと `image_objects_default` に入る。
 
 ---
 
@@ -1480,7 +1482,7 @@ RealMoji は「自撮り写真で返すリアクション」。1投稿につき1
 ⑦ beginRelationshipTx(自分, 投稿者)
      自分==投稿者 → 400 invalid_relationship（⑥で弾かれるので通常到達しない）
      どちらかが非 active → 404 relationship_not_found
-     → 2人の users 行を ID 昇順でロック
+     → 2人の users 行を ID 昇順でロック（自分は FOR NO KEY UPDATE、投稿者は FOR SHARE）
 ⑧ canViewPost(自分, postId) が false → 403 interaction_forbidden
 ⑨ UPDATE realmojis SET replaced_at = now
      WHERE post_id=? AND reactor_id=? AND replaced_at IS NULL AND deleted_at IS NULL
@@ -1673,10 +1675,22 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 ① actor == target、または target == "" → 400 invalid_relationship
 ② トランザクション開始
 ③ min(actor,target) → max(actor,target) の順に
-     SELECT id FROM users WHERE id=? AND status='active' FOR NO KEY UPDATE
+     SELECT id FROM users WHERE id=? AND status='active' <ロック>
+       actor（操作する本人）: FOR NO KEY UPDATE
+       target（相手）: FOR SHARE
      どちらかが存在しない / 非 active → 404 relationship_not_found
      ※ ID 昇順でロックするのでデッドロックしない
 ```
+
+本人を排他、相手を共有でロックするので、同じ2人への操作は直列のまま、別々のユーザーから同じ相手への操作は競合しない。
+
+| 2つの操作 | 競合する行 |
+|---|---|
+| どちらも A が本人 | A の行（排他同士） |
+| 片方は A が本人、もう片方は B が本人 | A の行と B の行（排他と共有） |
+| 別々のユーザーが同じ相手へ操作 | なし（共有同士） |
+
+`FOR KEY SHARE` は `FOR NO KEY UPDATE` と競合せず、A と B が互いを本人として行う操作（例：A が B をフォローし、B が A をブロックする）が同時に通るので使わない。相手の行の更新（退会、認定の変更など）は `FOR SHARE` と競合するので待ち合わせになる。
 
 ---
 
@@ -1699,18 +1713,22 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 
 ```
 ① beginRelationshipTx(自分, recipientId)
-② isBlocked(双方向) → true なら 409 relationship_conflict
-③ getFriendIDs(自分) に recipientId が含まれる → 409 relationship_conflict（既に友だち）
-④ SELECT id FROM friend_requests WHERE status='pending'
-     AND ((requester=自分 AND recipient=相手) OR (requester=相手 AND recipient=自分))
+② 次の3つを1本の SQL で取得する
+     ・ブロック関係（双方向）
+     ・友だち関係
+     ・pending の申請: friend_requests WHERE status='pending'
+         AND ((requester=自分 AND recipient=相手) OR (requester=相手 AND recipient=自分))
+③ ブロック関係あり → 409 relationship_conflict
+④ 既に友だち → 409 relationship_conflict
+⑤ pending の申請の有無で分岐
    ├─ 見つかった場合:
    │    ├─ requester == 自分 → 409 relationship_conflict（二重申請）
    │    └─ requester == 相手 → ★相互申請なので即成立
-   │         ├─ UPDATE friend_requests SET status='accepted', updated_at=now
+   │         ├─ UPDATE friend_requests SET status='accepted', updated_at=now RETURNING …
    │         └─ INSERT friendships (uuid, min(2者), max(2者), source_request_id)
    └─ 見つからない場合:
-        └─ INSERT friend_requests (uuid, 自分, 相手, 'pending', now, now)
-⑤ 読み戻して COMMIT
+        └─ INSERT friend_requests (uuid, 自分, 相手, 'pending', now, now) RETURNING …
+⑥ COMMIT
 ```
 
 **レスポンス** `201 Created`
@@ -1752,13 +1770,13 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
      cancel なのに requester でない、
      または accept/reject なのに recipient でない
      → 403 relationship_action_forbidden
-④ beginRelationshipTx(requester, recipient)
+④ beginRelationshipTx(自分, 申請のもう一方のユーザー)
 ⑤ 申請を再取得して status != 'pending' → 403 relationship_action_forbidden
 ⑥ accept の場合:
      ├─ isBlocked(双方向) → true なら 409 relationship_conflict
      └─ INSERT friendships
-⑦ UPDATE friend_requests SET status = <新status>, updated_at = now
-⑧ 読み戻して COMMIT
+⑦ UPDATE friend_requests SET status = <新status>, updated_at = now RETURNING …
+⑧ COMMIT
 ```
 
 **レスポンス** `200 OK`
@@ -1876,10 +1894,10 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 
 ```
 ① beginRelationshipTx(自分, userId)
-② getUser(userId)
+② 相手の accountType、ブロック関係（双方向）、既存の follows 行を1本の SQL で取得する
 ③ accountType != 'certified_public' → 409 relationship_conflict
      ★一般ユーザーはフォローできない
-④ isBlocked(双方向) → true なら 409 relationship_conflict
+④ ブロック関係あり → 409 relationship_conflict
 ⑤ 既に follows 行がある → 409 relationship_conflict
 ⑥ INSERT follows (uuid, follower_id=自分, followee_id=相手)
 ⑦ COMMIT
@@ -2259,7 +2277,7 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 | `session.go` | 162 | ユーザーセッションの検証・発行・無効化 |
 | `admin_session.go` | 115 | 管理者セッション |
 | `user.go` | 65 | `User` 型、バリデーション関数、`userColumns` |
-| `user_api.go` | 237 | register / login / logout / getMe / updateMe |
+| `user_api.go` | 223 | register / login / logout / getMe / updateMe |
 | `user_read_api.go` | 121 | ユーザー検索 / ユーザー取得 |
 | `profile_image_api.go` | 97 | プロフィール画像の設定・削除 |
 | `account_deletion_api.go` | 39 | アカウント論理削除 |
@@ -2277,10 +2295,10 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 | `image_signature.go` | 42 | 署名付きURL生成（HMAC 1000回反復） |
 | `image_api.go` | 98 | 画像配信と署名検証 |
 | `notification_api.go` | 82 | SSE 通知（ワンショット） |
-| `relationship.go` | 73 | `beginRelationshipTx` / `isBlocked` / 共通ヘルパ |
-| `relationship_api.go` | 183 | フレンド解除 / フォロー / ブロック |
+| `relationship.go` | 87 | `beginRelationshipTx` / `isBlocked` / 共通ヘルパ |
+| `relationship_api.go` | 178 | フレンド解除 / フォロー / ブロック |
 | `relationship_list_api.go` | 102 | 関係性一覧（5種） |
-| `friend_request_api.go` | 164 | フレンド申請の作成・遷移 |
+| `friend_request_api.go` | 154 | フレンド申請の作成・遷移 |
 | `admin_api.go` | 69 | 管理者ログイン / ログアウト |
 | `admin_user_api.go` | 39 | 認定公開アカウントの付与・（禁止された）解除 |
 | `admin_posting_window_api.go` | 88 | 投稿枠のオープン |
@@ -2317,9 +2335,9 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 
 ### 一意性・ロック
 
-- `users.username` に UNIQUE 制約なし。`LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE` ＋ `EXISTS` で担保（`register`）
-- `POST /api/admin/posting-window` も同じ `LOCK TABLE users` を取る
-- 書き込み系ハンドラはほぼ全てが `SELECT id FROM users WHERE id=? FOR NO KEY UPDATE` で自分（と相手）の行をロック → ユーザー単位で直列化
+- `users.username` は UNIQUE インデックス `users_username` で担保。`register` は `INSERT … ON CONFLICT (username) DO NOTHING` の 1 文で登録する
+- `POST /api/admin/posting-window` は `LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE` を取る。`register` の `INSERT` が取る `ROW EXCLUSIVE` と競合するため、通知の一括 INSERT とユーザー登録は直列化される
+- 書き込み系ハンドラはほぼ全てが `SELECT id FROM users WHERE id=? FOR NO KEY UPDATE` で自分（と相手）の行をロック → ユーザー単位で直列化。ただし `beginRelationshipTx` の相手の行は `FOR SHARE`
 - 2者を扱う場合は必ず `min(id) → max(id)` の順でロック（`beginRelationshipTx`、`createCommentHandler`）
 
 ### クエリの重さ

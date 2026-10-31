@@ -91,22 +91,32 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		var lockedUserID string
-		if err := tx.GetContext(ctx, &lockedUserID, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID); err != nil {
-			return err
-		}
-		user, err := getUser(ctx, tx, userID)
+		user, err := lockUser(ctx, tx, userID)
 		if err != nil {
 			return err
 		}
+		// FOR SHARE は同じ SELECT の集約と併用できないため、投稿数はスカラーサブクエリで取得する。
+		// 投稿の作成・削除はユーザー行のロックで直列化済みなので、投稿枠のロック待ち前のスナップショットで読んでも結果は変わらない。
+		const windowQuery = `
+   SELECT w.id, w.starts_at, w.on_time_deadline,
+          (SELECT count(*) FROM posts p JOIN posting_windows pw ON pw.id = p.posting_window_id
+           WHERE p.author_id = $2 AND pw.local_date = w.local_date AND p.deleted_at IS NULL) AS active,
+          (SELECT count(*) FROM posts p JOIN posting_windows pw ON pw.id = p.posting_window_id
+           WHERE p.author_id = $2 AND pw.local_date = w.local_date AND p.deleted_at IS NOT NULL) AS deleted
+   FROM posting_windows w
+   WHERE w.region = $1 AND w.ended_at IS NULL
+   FOR SHARE OF w
+  `
 		var window struct {
-			ID        string    `db:"id"`
-			LocalDate time.Time `db:"local_date"`
-			StartsAt  time.Time `db:"starts_at"`
+			ID             string    `db:"id"`
+			StartsAt       time.Time `db:"starts_at"`
+			OnTimeDeadline time.Time `db:"on_time_deadline"`
+			Active         int       `db:"active"`
+			Deleted        int       `db:"deleted"`
 		}
-		err = tx.GetContext(ctx, &window, `SELECT id, local_date, starts_at FROM posting_windows WHERE region = $1 AND ended_at IS NULL FOR SHARE`, user.Region)
+		err = tx.GetContext(ctx, &window, windowQuery, user.Region, userID)
 		if errors.Is(err, sql.ErrNoRows) {
-			err = tx.GetContext(ctx, &window, `SELECT id, local_date, starts_at FROM posting_windows WHERE region = $1 AND ended_at IS NULL FOR SHARE`, user.Region)
+			err = tx.GetContext(ctx, &window, windowQuery, user.Region, userID)
 		}
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -114,39 +124,28 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			}
 			return err
 		}
-		var counts struct {
-			Active  int `db:"active"`
-			Deleted int `db:"deleted"`
-		}
-		if err := tx.GetContext(ctx, &counts, `
-   SELECT count(*) FILTER (WHERE deleted_at IS NULL) AS active,
-          count(*) FILTER (WHERE deleted_at IS NOT NULL) AS deleted
-   FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
-   WHERE p.author_id = $1 AND w.local_date = $2
-  `, userID, window.LocalDate); err != nil {
-			return err
-		}
 		postedAt := time.Now().UTC()
-		if counts.Active != 0 || counts.Deleted >= 2 || postedAt.Before(window.StartsAt) {
+		if window.Active != 0 || window.Deleted >= 2 || postedAt.Before(window.StartsAt) {
 			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
 		}
 		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at) VALUES ($1, $2, $3, 'image/jpeg', $4)`, imageID, userID, imageData, postedAt); err != nil {
-			return err
-		}
 		postID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `
+		var post Post
+		if err := tx.GetContext(ctx, &post, `
+   WITH image AS (
+     INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at)
+     VALUES ($1, $2, $3, 'image/jpeg', $4)
+   )
    INSERT INTO posts (id, author_id, posting_window_id, image_id, caption, visibility,
                       location_kind, latitude, longitude, locality, posted_at)
-   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-  `, postID, userID, window.ID, imageID, input.Caption, input.Visibility,
-			location.Kind, location.Latitude, location.Longitude, location.Locality, postedAt); err != nil {
+   VALUES ($5, $2, $6, $1, $7, $8, $9, $10, $11, $12, $4)
+   RETURNING id, author_id, posting_window_id, image_id, caption, visibility,
+             location_kind, latitude, longitude, locality, posted_at
+  `, imageID, userID, imageData, postedAt, postID, window.ID, input.Caption, input.Visibility,
+			location.Kind, location.Latitude, location.Longitude, location.Locality); err != nil {
 			return err
 		}
-		post, err := getPost(ctx, tx, postID)
-		if err != nil {
-			return err
-		}
+		post.OnTimeDeadline = window.OnTimeDeadline
 		if err := tx.Commit(); err != nil {
 			return err
 		}

@@ -63,3 +63,12 @@ func getUser(ctx context.Context, db sqlx.QueryerContext, userID string) (User, 
 	}
 	return user, user.setImageKey()
 }
+
+func lockUser(ctx context.Context, db sqlx.QueryerContext, userID string) (User, error) {
+	var user User
+	err := sqlx.GetContext(ctx, db, &user, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE id = $1 AND status = 'active' FOR NO KEY UPDATE`, userID)
+	if err != nil {
+		return user, err
+	}
+	return user, user.setImageKey()
+}
