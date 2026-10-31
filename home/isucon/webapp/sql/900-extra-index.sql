@@ -14,3 +14,7 @@ CREATE INDEX IF NOT EXISTS friend_requests_requester_id_recipient_id_pending ON 
 CREATE INDEX IF NOT EXISTS friend_requests_recipient_id_requester_id_pending ON friend_requests(recipient_id, requester_id) WHERE status = 'pending';
 -- #51 POST /api/admin/posting-window の通知一括INSERT (admin_posting_window_api.go openPostingWindowHandler)
 CREATE INDEX IF NOT EXISTS users_active_region ON users(region) WHERE status = 'active';
+-- #62 GET /api/users の部分一致を SQL 側で行うための列 (user_read_api.go searchUsersHandler)
+-- 値は Go の normalizeSearchText(display_name)。登録・表示名変更時に書き、initialize と起動時に全行を突き合わせて埋める。
+-- コードより先に適用する
+ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name_search text;

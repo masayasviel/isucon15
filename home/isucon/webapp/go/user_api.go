@@ -87,11 +87,11 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 		// ユーザー名が一意である必要があります。一意性は users_username のUNIQUEインデックスで担保します。
 		var user User
 		err := h.DB.GetContext(c.Request().Context(), &user, `
-   INSERT INTO users (id, username, secret_key_hash, display_name, region)
-   VALUES ($1, $2, $3, $4, $5)
+   INSERT INTO users (id, username, secret_key_hash, display_name, display_name_search, region)
+   VALUES ($1, $2, $3, $4, $5, $6)
    ON CONFLICT (username) DO NOTHING
    RETURNING `+strings.Join(userColumns, ", "),
-			uuid.NewString(), input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region)
+			uuid.NewString(), input.Username, hex.EncodeToString(hash[:]), input.DisplayName, normalizeSearchText(input.DisplayName), input.Region)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusConflict, "username_taken")
 		}
@@ -194,7 +194,7 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		defer tx.Rollback()
 		if input.DisplayName != nil {
-			if _, err := tx.ExecContext(ctx, `UPDATE users SET display_name = $2, updated_at = clock_timestamp() WHERE id = $1`, session.UserID, *input.DisplayName); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE users SET display_name = $2, display_name_search = $3, updated_at = clock_timestamp() WHERE id = $1`, session.UserID, *input.DisplayName, normalizeSearchText(*input.DisplayName)); err != nil {
 				return err
 			}
 		}
