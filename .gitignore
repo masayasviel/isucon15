@@ -163,6 +163,8 @@
 /home/isucon/webapp/tenant_db/
 /home/isucon/webapp/go/isuports
 /home/isucon/.*
+!/home/isucon/analysis/
+!/home/isucon/analysis/**
 
 !/result/
 
