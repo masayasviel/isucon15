@@ -15,6 +15,8 @@ type HandlerContext struct {
 	DB     *sqlx.DB
 	Config *Config
 	IPBans *IPBanList
+
+	notifications notificationHub
 }
 
 func NewServer(config *Config) *echo.Echo {
@@ -53,6 +55,7 @@ func NewServer(config *Config) *echo.Echo {
 		Config: config,
 		IPBans: &IPBanList{},
 	}
+	go watchNotifications(handlerContext)
 	e.Use(IPBanMiddleware(handlerContext))
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))
