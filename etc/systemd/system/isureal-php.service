@@ -1,0 +1,18 @@
+[Unit]
+Description=isureal-php
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=isucon
+Group=isucon
+WorkingDirectory=/home/isucon/webapp/php
+EnvironmentFile=/home/isucon/env.sh
+Environment=ISUREAL_PHP_FPM_ERROR_LOG=syslog
+ExecStart=/home/isucon/local/php/sbin/php-fpm --nodaemonize --force-stderr --fpm-config /home/isucon/webapp/php/php-fpm.conf
+ExecReload=/bin/kill -USR2 $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

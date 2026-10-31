@@ -1,0 +1,13 @@
+[Unit]
+Description=Register the contest instance with the portal on every boot
+Wants=network-online.target
+After=network-online.target cloud-final.service
+StartLimitIntervalSec=0
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/isucon-registration/register.py
+Restart=on-failure
+RestartSec=20s
+RemainAfterExit=yes
+[Install]
+WantedBy=cloud-init.target

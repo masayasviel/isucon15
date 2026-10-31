@@ -1,0 +1,16 @@
+[Unit]
+Description=isureal-ruby
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=isucon
+Group=isucon
+WorkingDirectory=/home/isucon/webapp/ruby
+EnvironmentFile=/home/isucon/env.sh
+ExecStart=/home/isucon/local/ruby/bin/bundle exec puma -C config/puma.rb
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=isureal-perl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=isucon
+Group=isucon
+WorkingDirectory=/home/isucon/webapp/perl
+EnvironmentFile=/home/isucon/env.sh
+Environment=PERL5LIB=/home/isucon/webapp/perl/local/lib/perl5
+Environment=MOJO_MODE=production
+ExecStart=/home/isucon/local/perl/bin/perl /home/isucon/webapp/perl/local/bin/hypnotoad -f /home/isucon/webapp/perl/script/isureal
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

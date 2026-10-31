@@ -1,0 +1,15 @@
+[Unit]
+Description=ISUCON2026 post-contest environment validation
+Wants=network-online.target ssh.service
+Requires=envcheck-baseline.service
+After=network-online.target ssh.service cloud-final.service envcheck-baseline.service isucon-register.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStartPre=/usr/bin/rm -f /var/lib/isucon-envcheck/result.json
+ExecStart=/usr/local/bin/isucon-contest-envcheck
+TimeoutStartSec=210s
+
+[Install]
+WantedBy=cloud-init.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=isureal-python
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=isucon
+Group=isucon
+WorkingDirectory=/home/isucon/webapp/python
+EnvironmentFile=/home/isucon/env.sh
+ExecStart=/home/isucon/webapp/python/.venv/bin/gunicorn
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

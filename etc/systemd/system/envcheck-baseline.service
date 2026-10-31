@@ -1,0 +1,20 @@
+[Unit]
+Description=Record ISUCON2026 provisioning baseline once
+Wants=network-online.target ssh.service
+After=network-online.target ssh.service cloud-final.service isucon-router-bootstrap.service
+ConditionPathExists=/etc/isucon/envcheck.json
+ConditionPathExists=!/var/lib/isucon-envcheck/baseline.json
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/isucon-contest-envcheck --record-baseline
+ExecStartPost=/usr/bin/systemctl --no-block start envcheck.service
+TimeoutStartSec=210s
+Restart=on-failure
+RestartSec=20s
+RemainAfterExit=yes
+
+[Install]
+WantedBy=cloud-init.target

@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# Run ANALYZE on all databases in the upgraded cluster
+
+set -eu
+
+oldversion="$1"
+cluster="$2"
+newversion="$3"
+phase="$4"
+
+case $newversion in
+    9.2|9.3)
+        analyze="--analyze-only"
+        ;;
+    *)
+        analyze="--analyze-in-stages"
+        ;;
+esac
+
+case $newversion in
+    9.5|9.6|[1-7]*)
+        [ "${PGJOBS:-}" ] && jobs="--jobs=$PGJOBS"
+        ;;
+esac
+
+case $phase in
+    finish)
+        vacuumdb --cluster "$newversion/$cluster" --all $analyze ${jobs:-}
+        ;;
+esac
+
+exit 0
