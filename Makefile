@@ -1,4 +1,4 @@
-.PHONY: deploy nginx-log-reset nginx-log-rotate
+.PHONY: deploy nginx-log-reset nginx-log-rotate index index-drop
 
 IP := $(shell hostname -I | awk '{print $$1}' | tr '.' '-')
 NOW := $(shell date +%Y%m%d-%H%M%S)
@@ -24,3 +24,26 @@ nginx-log-rotate:
 	git push -u origin $(NGINX_LOG_BRANCH)
 	gh pr create --fill
 	git switch main
+
+ENV_FILE := /home/isucon/env.sh
+SQL_DIR := home/isucon/webapp/sql
+
+PSQL = set -eu; \
+	. $(ENV_FILE); \
+	PGPASSWORD="$$ISUREAL_DB_PASSWORD" psql \
+		--no-psqlrc \
+		--no-password \
+		--host="$$ISUREAL_DB_HOST" \
+		--port="$$ISUREAL_DB_PORT" \
+		--username="$$ISUREAL_DB_USER" \
+		--dbname="$$ISUREAL_DB_NAME" \
+		--set=ON_ERROR_STOP=1
+
+# 900-extra-index.sql の追加インデックスを適用する。
+index:
+	$(PSQL) --file=$(SQL_DIR)/900-extra-index.sql
+
+# 効果が無かったインデックスを名前で指定して外す (make index-drop NAME=xxx)。
+index-drop:
+	test -n "$(NAME)" || { echo 'usage: make index-drop NAME=<index_name>' >&2; exit 1; }
+	$(PSQL) --command='DROP INDEX IF EXISTS $(NAME)'
