@@ -167,7 +167,7 @@ Config.Region（サーバ）     session.Region（= users.region）
 | `RegionMiddleware` | 上記以外の全エンドポイントで一致必須 |
 | `posting_windows` | `UNIQUE(region, local_date)` ＋ `ended_at IS NULL` の行はリージョンごとに**最大1件**（部分ユニークインデックス `posting_windows_one_active_region`） |
 | 投稿枠の取得 | `WHERE region = <ユーザーの region> AND ended_at IS NULL`（`post_api.go`, `posting_window_api.go`） |
-| 枠オープン | 管理者が `region` を指定して開く。`notifications` はそのリージョンの active ユーザー全員に INSERT |
+| 枠オープン | 管理者が `region` を指定して開く。通知は開いている `posting_windows` から導出し、`notifications` には INSERT しない |
 | `HasPostedToday` 判定 | 「自分の region で現在開いている枠」と同じ `local_date` の枠に投稿があるか（`post.go`） |
 | SSE 通知 | 接続中に `users.region` がセッション時のリージョンと変わったら接続を閉じる（`notification_api.go`） |
 | `PATCH /api/me` | `region` を変更できる。変更後はそのユーザーは別リージョンのサーバでしか API を使えなくなる |
@@ -386,17 +386,18 @@ post.Visibility == "public"       ─▶ true
 ```
  管理者: POST /api/admin/posting-window {region, localDate, onTimeSeconds}
     │
-    ├─ LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE
+    ├─ SELECT pg_advisory_xact_lock(hashtext(region))（同 region の枠開始を直列化）
     ├─ 同 region に local_date >= 指定日 の枠があれば 409 posting_window_conflict
     ├─ startsAt = clock_timestamp()
     ├─ UPDATE posting_windows SET ended_at = startsAt WHERE region=? AND ended_at IS NULL
     │     → 旧枠を閉じる（この瞬間、旧枠の投稿は canView で見えなくなる）
-    ├─ INSERT posting_windows (starts_at = startsAt,
-    │                          on_time_deadline = startsAt + onTimeSeconds秒)
-    └─ INSERT notifications … そのリージョンの status='active' ユーザー全員分
-           │
-           ▼
-      GET /api/notifications (SSE) が拾って配信
+    └─ INSERT posting_windows (starts_at = startsAt,
+                               on_time_deadline = startsAt + onTimeSeconds秒)
+           → COMMIT
+                │
+                ▼
+      サーバごとの共有ポーリングが開いている枠と active ユーザーを確認
+                → GET /api/notifications (SSE) が接続後に開始した枠を配信
 ```
 
 `ended_at IS NULL` の行はリージョンごとに1件だけ（部分ユニークインデックスで DB が保証）。
@@ -1627,17 +1628,22 @@ RealMoji は「自撮り写真で返すリアクション」。1投稿につき1
 ```
 ① connectedAt = SELECT clock_timestamp()（DBの現在時刻）
 ② ヘッダを即送信: Content-Type: text/event-stream, 200 OK → Flush
-③ 500ms ごとのループ:
-     ├─ getUser(自分)
-     │     エラー（削除された等）→ 接続終了
-     ├─ user.Region != session.Region → 接続終了   ★リージョン移動で切れる
-     ├─ SELECT n.id, n.posting_window_id, w.region, n.created_at
-     │    FROM notifications n JOIN posting_windows w ON w.id = n.posting_window_id
-     │    WHERE n.user_id = ? AND n.created_at > connectedAt AND w.ended_at IS NULL
-     │    ORDER BY n.created_at, n.id LIMIT 1
-     ├─ 見つかった → "data: {json}\n\n" を書いて Flush し、★return（接続終了）
-     ├─ ErrNoRows 以外のエラー → 接続終了
-     └─ ctx.Done() または ticker を待つ
+③ 接続を共有の notificationHub に登録し、結果または ctx.Done() を待つ
+④ NewServer で起動したサーバごとに1つの goroutine が 500ms ごとに確認:
+     ├─ 対象接続の一覧を固定（同じユーザーの複数接続はユーザーIDをまとめる）
+     ├─ 接続が無ければクエリを発行しない
+     ├─ 1本の SELECT で対象ユーザーと開いている枠を取得:
+     │    FROM users u
+     │    LEFT JOIN posting_windows w ON w.region = u.region AND w.ended_at IS NULL
+     │    WHERE u.id = ANY(<対象ユーザーID配列>)
+     │      AND u.status = 'active' AND u.region = <サーバの region>
+     ├─ DB エラー → この周期の対象接続を終了
+     └─ 接続ごとに次の順で判定:
+          ├─ ユーザーが結果に無い → 接続終了（退会・リージョン変更）
+          ├─ 枠が無い、または starts_at <= connectedAt → 次の周期を待つ
+          └─ starts_at > connectedAt → 通知を渡し、対象接続の監視を終了
+⑤ ハンドラが "data: {json}\n\n" を書いて Flush し、★return（接続終了）
+   切断時には共有の接続一覧から登録を解除する
 ```
 
 **レスポンス** `200 OK`、`Content-Type: text/event-stream`
@@ -1647,14 +1653,17 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 
 ```
 
-- **接続後に作られた通知**のみ対象（`created_at > connectedAt`）。接続前の通知は配信されない
+- **接続後に開始した投稿枠**のみ対象（`starts_at > connectedAt`）。接続前に開始した枠は配信されない
 - **枠が開いているもの**のみ（`w.ended_at IS NULL`）
+- JSON のキーは `id`、`postingWindowId`、`region`、`createdAt`。`createdAt` は枠の `starts_at`
+- 通知 ID は `uuid.NewSHA1(uuid.NameSpaceOID, []byte(windowID+":"+userID)).String()`。同じユーザー・同じ枠なら接続が別でも同じ値になる
+- ユーザーが退会済み、またはサーバのリージョンから移動済みなら、通知を送らず接続を閉じる
 - 1件送ったら接続を閉じる。クライアントは再接続して待ち受ける必要がある
 - エラーは HTTP ステータスで返らない（ヘッダ送信済みのため）。異常時は単に接続が閉じる
 
 **エラー**: 401 `invalid_session` / 403 `region_mismatch`（いずれもヘッダ送信前なので通常の JSON エラー）
 
-> 接続1本あたり 500ms ごとに2クエリ（`getUser` + 通知検索）が走る。
+> 通知の確認クエリは接続数によらず、1サーバあたり 500ms ごとに1本。接続が無ければ0本。接続時の認証と `SELECT clock_timestamp()` は別途実行する。`notifications` テーブルは参照しない。
 
 ---
 
@@ -2110,7 +2119,7 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 
 | 項目 | 内容 |
 |---|---|
-| 処理内容 | 新しい投稿枠を開き、対象リージョンの全ユーザーに通知を作る |
+| 処理内容 | 新しい投稿枠を開く。対象リージョンの接続中ユーザーへの通知は SSE の共有ポーリングが導出する |
 | 認証 | 管理者 |
 | リージョン | 不要（`region` はボディで指定） |
 | 実装 | `admin_posting_window_api.go` |
@@ -2133,8 +2142,9 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 ① region 不正 または localDate パース失敗 → 400 invalid_posting_window
 ② seconds = onTimeSeconds ?? 86400
 ③ トランザクション開始
-④ LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE
-     ← 通知の一括 INSERT とユーザー登録・リージョン変更を直列化するため
+④ SELECT pg_advisory_xact_lock(hashtext(region))
+     ← 同じリージョンへの枠開始を、競合確認より前に直列化する
+       トランザクション終了時に解放。users のテーブルロックは取らない
 ⑤ SELECT EXISTS(SELECT 1 FROM posting_windows
                 WHERE region=? AND local_date >= ?)
      → true なら 409 posting_window_conflict
@@ -2145,11 +2155,7 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 ⑧ INSERT posting_windows (uuid, region, local_date,
                            starts_at = startsAt,
                            on_time_deadline = startsAt + seconds秒)
-⑨ INSERT INTO notifications (id, user_id, posting_window_id, created_at)
-     SELECT gen_random_uuid()::text, id, <windowID>, startsAt
-     FROM users WHERE region = ? AND status = 'active'
-     ← 対象リージョンの全 active ユーザー分を一括 INSERT
-⑩ 読み戻して COMMIT
+⑨ 読み戻して COMMIT（notifications への INSERT は行わない）
 ```
 
 **レスポンス** `201 Created`
@@ -2174,7 +2180,7 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
              →  旧枠の投稿へのコメントが canComment で false になる
 新枠を開く    →  全ユーザーの canPost が true に戻る（削除回数 < 2 の範囲で）
              →  HasPostedToday が false に戻る（＝再び「投稿しないと見えない」状態）
-通知を作る    →  SSE 接続中のクライアントに配信される
+枠を COMMIT  →  SSE の共有ポーリングが検知し、接続後に開始した枠を配信する
 ```
 
 ---
@@ -2336,7 +2342,7 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 ### 一意性・ロック
 
 - `users.username` は UNIQUE インデックス `users_username` で担保。`register` は `INSERT … ON CONFLICT (username) DO NOTHING` の 1 文で登録する
-- `POST /api/admin/posting-window` は `LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE` を取る。`register` の `INSERT` が取る `ROW EXCLUSIVE` と競合するため、通知の一括 INSERT とユーザー登録は直列化される
+- `POST /api/admin/posting-window` は競合確認の前に `SELECT pg_advisory_xact_lock(hashtext(region))` を取り、同じリージョンへの枠開始を直列化する。同じ日付の同時開始は一方が 409 `posting_window_conflict` になる。`users` のテーブルロックと通知の一括 INSERT は行わない
 - 書き込み系ハンドラはほぼ全てが `SELECT id FROM users WHERE id=? FOR NO KEY UPDATE` で自分（と相手）の行をロック → ユーザー単位で直列化。ただし `beginRelationshipTx` の相手の行は `FOR SHARE`
 - 2者を扱う場合は必ず `min(id) → max(id)` の順でロック（`beginRelationshipTx`、`createCommentHandler`）
 
@@ -2347,7 +2353,8 @@ data: {"id":"uuid","postingWindowId":"uuid","region":"asia","createdAt":"2026-10
 - `GET /api/me/export`: `LIMIT` が無く、全投稿の画像バイナリをメモリ上の ZIP に詰める
 - `signedImageURL`: HMAC-SHA256 を **1000 回反復**。レスポンスに含まれる画像URL1本ごとに実行される
 - `User.setImageKey()`: `selectPostsWithAuthor` / `selectCommentsWithAuthor` / `selectCurrentRealMojis` が取得行ごとに呼ぶ
-- `GET /api/notifications`: 接続1本あたり 500ms 間隔で2クエリ
+- `GET /api/notifications`: 接続数によらず1サーバあたり 500ms 間隔で1クエリ。接続が無い間は発行しない。接続時の認証と `SELECT clock_timestamp()` は別途実行する
+- `POST /api/admin/posting-window`: 通知の一括 INSERT を廃止し、枠の更新・作成だけを行う。ユーザー数に比例する通知行の作成と、それを守る `users` のテーブルロックが不要
 - `posts` のインデックスは `posts_author_id` と `posts_posting_window_id` のみ（`posted_at` 系の複合インデックスは無い）
 
 ### その他
