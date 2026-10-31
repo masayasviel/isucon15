@@ -2,6 +2,7 @@ package isureal
 
 import (
 	"context"
+	"log/slog"
 	"os"
 
 	"github.com/jmoiron/sqlx"
@@ -53,6 +54,10 @@ func NewServer(config *Config) *echo.Echo {
 		Config: config,
 		IPBans: &IPBanList{},
 	}
+	if err := handlerContext.IPBans.reload(context.Background(), db); err != nil {
+		slog.Error("failed to load ip bans", "error", err)
+	}
+	go handlerContext.IPBans.watch(db)
 	e.Use(IPBanMiddleware(handlerContext))
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))
