@@ -987,31 +987,35 @@ canPost = (同 local_date の生存投稿が 0 件)
 ⑤ 画像を全読み → jpeg.Decode 失敗 → 400 invalid_post
 ⑥ 幅 > 4096 または 高さ > 4096 → 400 invalid_post
 ⑦ トランザクション開始
-⑧ SELECT id FROM users WHERE id=? FOR NO KEY UPDATE   ← 自分の行をロック
-⑨ getUser(自分)
-⑩ SELECT id, local_date, starts_at FROM posting_windows
-     WHERE region = <自分の region> AND ended_at IS NULL FOR UPDATE
+⑧ SELECT <userColumns> FROM users WHERE id=? AND status='active' FOR NO KEY UPDATE
+     ← 自分の行をロックして取得し、setImageKey を呼ぶ
+⑨ 投稿枠のロックと、同 local_date の自分の投稿数の集計を1文で行う
+     SELECT w.id, w.starts_at, w.on_time_deadline,
+            (未削除の投稿数のスカラーサブクエリ) AS active,
+            (削除済みの投稿数のスカラーサブクエリ) AS deleted
+     FROM posting_windows w
+     WHERE w.region = <自分の region> AND w.ended_at IS NULL FOR SHARE OF w
      行なし → 409 post_slot_unavailable
-⑪ 同 local_date の自分の投稿数を集計
-     SELECT count FILTER(deleted_at IS NULL) AS active,
-            count FILTER(deleted_at IS NOT NULL) AS deleted
-     FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
-     WHERE p.author_id = ? AND w.local_date = ?
-⑫ postedAt = time.Now().UTC()
+⑩ postedAt = time.Now().UTC()
    active != 0 || deleted >= 2 || postedAt < window.starts_at
      → 409 post_slot_unavailable
-⑬ INSERT image_objects (uuid, 自分, data, 'image/jpeg', created_at = postedAt)
-⑭ INSERT posts (uuid, author, window, image, caption, visibility,
-                 location_*, posted_at = postedAt)
-⑮ getPost で読み戻し → COMMIT
+⑪ データ変更CTEで画像と投稿を1文で INSERT する
+     WITH image AS (
+       INSERT image_objects (uuid, 自分, data, 'image/jpeg', created_at = postedAt)
+     )
+     INSERT posts (uuid, author, window, image, caption, visibility,
+                   location_*, posted_at = postedAt)
+     RETURNING posts の各カラム
+   on_time_deadline は ⑨ の値を使う
+⑫ COMMIT → 画像をファイルに書き出す（失敗は無視）
 ```
 
 **レスポンス** `201 Created` — `createPostResponse`
 
 **エラー**: 400 `invalid_post` / 401 `invalid_session` / 403 `region_mismatch` / 409 `post_slot_unavailable`
 
-> ⑩ は `sql.ErrNoRows` のとき**まったく同じクエリをもう一度実行**している（実装のまま。リトライとして意味を持たない）。
-> ⑬ で `image_objects.created_at` に `postedAt` を明示している点に注意。`created_at` は月次パーティションのキーなので、対応するパーティションが無い値だと `image_objects_default` に入る。
+> ⑨ は `sql.ErrNoRows` のとき**まったく同じクエリをもう一度実行**している（実装のまま。リトライとして意味を持たない）。
+> ⑪ で `image_objects.created_at` に `postedAt` を明示している点に注意。`created_at` は月次パーティションのキーなので、対応するパーティションが無い値だと `image_objects_default` に入る。
 
 ---
 
