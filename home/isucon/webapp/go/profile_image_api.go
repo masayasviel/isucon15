@@ -59,6 +59,7 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		_ = writeImageFile(imageID, data)
 		return c.NoContent(http.StatusNoContent)
 	}
 }
