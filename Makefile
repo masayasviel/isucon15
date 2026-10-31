@@ -1,4 +1,4 @@
-.PHONY: deploy nginx-log-reset nginx-log-rotate index index-drop index-verify
+.PHONY: deploy nginx-log-reset nginx-log-rotate index index-drop
 
 IP := $(shell hostname -I | awk '{print $$1}' | tr '.' '-')
 NOW := $(shell date +%Y%m%d-%H%M%S)
@@ -47,10 +47,3 @@ index:
 index-drop:
 	test -n "$(NAME)" || { echo 'usage: make index-drop NAME=<index_name>' >&2; exit 1; }
 	$(PSQL) --command='DROP INDEX IF EXISTS $(NAME)'
-
-# インデックスが存在し、実際に Index Scan で使われているかを確認する。
-index-verify:
-	$(PSQL) --command='\d login_sessions'
-	$(PSQL) --command="EXPLAIN SELECT s.user_id, s.token_hash, s.created_at, u.region \
-		FROM login_sessions s JOIN users u ON u.id = s.user_id \
-		WHERE s.token_hash = 'dummy' AND s.active = true AND u.status = 'active'"
