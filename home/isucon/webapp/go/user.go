@@ -49,6 +49,37 @@ func userColumnsAs(alias, prefix string) string {
 	return strings.Join(columns, ", ")
 }
 
+// userJSONObject は alias のユーザー行を userColumns と同じキーを持つ JSON オブジェクトにする SQL 式を返す。
+// 結果は userJSON に復元できる。
+func userJSONObject(alias string) string {
+	pairs := make([]string, len(userColumns))
+	for i, column := range userColumns {
+		pairs[i] = fmt.Sprintf(`'%s', %s.%s`, column, alias, column)
+	}
+	return "json_build_object(" + strings.Join(pairs, ", ") + ")"
+}
+
+// userJSON は userJSONObject で生成した JSON を受け取るための構造体。
+type userJSON struct {
+	ID             string  `json:"id"`
+	Username       string  `json:"username"`
+	SecretKeyHash  string  `json:"secret_key_hash"`
+	DisplayName    string  `json:"display_name"`
+	Bio            string  `json:"bio"`
+	ProfileImageID *string `json:"profile_image_id"`
+	Region         string  `json:"region"`
+	AccountType    string  `json:"account_type"`
+	Status         string  `json:"status"`
+}
+
+func (row userJSON) user() (User, error) {
+	user := User{
+		ID: row.ID, Username: row.Username, SecretKeyHash: row.SecretKeyHash, DisplayName: row.DisplayName,
+		Bio: row.Bio, ProfileImageID: row.ProfileImageID, Region: row.Region, AccountType: row.AccountType, Status: row.Status,
+	}
+	return user, user.setImageKey()
+}
+
 func (user *User) setImageKey() error {
 	key, err := imageSigningKey(user.SecretKeyHash)
 	user.ImageKey = key

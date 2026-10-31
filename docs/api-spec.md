@@ -1291,17 +1291,19 @@ postedAt != beforePostedAt    → postedAt < beforePostedAt
 ```
 ① 期間をパース（失敗 → 400 invalid_memory_period）
 ② (beforePostedAt == nil) != (beforeId == "") → 400 invalid_pagination
-③ selectPostsWithAuthor(
-     "AND p.author_id = $1 AND w.local_date >= $2 AND w.local_date < $3
-      AND ($4::timestamptz IS NULL OR (p.posted_at,p.id) < ($4,$5))
-      ORDER BY p.posted_at DESC, p.id DESC LIMIT 51")
+③ 1クエリで取得（#63。セッション取得を除き DB 往復は1回）
+     CTE: posts JOIN posting_windows JOIN users(active)
+          "p.author_id = $1 AND w.local_date >= $2 AND w.local_date < $3
+           AND ($4::timestamptz IS NULL OR (p.posted_at,p.id) < ($4,$5))
+           ORDER BY p.posted_at DESC, p.id DESC LIMIT 51"
      ※ 自分の投稿のみ。可視性判定なし。枠が終了済みでも取得できる
+     各投稿に相関サブクエリで json_agg を付与:
+     ├─ realmojis_json: replaced_at/deleted_at IS NULL, reactor が active
+     │    ORDER BY created_at DESC, id DESC LIMIT 50（reactor は json_build_object）
+     └─ comments_json: deleted_at IS NULL, author が active
+          ORDER BY created_at, id LIMIT 50（author は json_build_object）
 ④ hasMore = (件数 > 50) → 先頭50件
-⑤ loadMemoryInteractions: 50件分の post_id をまとめて2クエリ
-     ├─ selectCurrentRealMojis(post_id IN (…) ORDER BY created_at DESC, id DESC)
-     │    → 各投稿につき先頭 50 件まで realmojis に詰める
-     └─ selectCommentsWithAuthor(post_id IN (…) ORDER BY created_at, id)
-          → 各投稿につき先頭 50 件まで comments に詰める
+⑤ JSON を RealMoji/User・Comment/User に復元し、newRealMojiResponse / newCommentResponse へ
 ```
 
 **レスポンス** `200 OK`
